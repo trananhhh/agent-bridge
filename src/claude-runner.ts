@@ -1,0 +1,87 @@
+import { spawn } from 'node:child_process';
+
+export interface ClaudeRunOptions {
+  prompt: string;
+  cwd: string;
+  resumeSessionId?: string;
+  fork?: boolean;
+  model?: string;
+  allowedTools?: string[];
+  noTools?: boolean;
+  appendSystemPrompt?: string;
+  timeoutMs?: number;
+}
+
+export interface ClaudeRunResult {
+  sessionId: string;
+  result: string;
+  isError: boolean;
+}
+
+export type ClaudeRunner = (opts: ClaudeRunOptions) => Promise<ClaudeRunResult>;
+
+const STDOUT_CAP = 5 * 1024 * 1024;
+// Child must not think it is nested inside the session that spawned the daemon.
+const STRIPPED_ENV = ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_ENTRYPOINT', 'BRIDGE_LIVE'];
+
+export function buildClaudeArgs(opts: Omit<ClaudeRunOptions, 'prompt' | 'cwd' | 'timeoutMs'>): string[] {
+  const args = ['-p', '--output-format', 'json', '--permission-mode', 'dontAsk'];
+  if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
+  if (opts.resumeSessionId && opts.fork) args.push('--fork-session');
+  if (opts.model) args.push('--model', opts.model);
+  if (opts.noTools) args.push('--tools=');
+  if (opts.allowedTools?.length) args.push('--allowedTools', opts.allowedTools.join(','));
+  if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt);
+  return args;
+}
+
+export function parseClaudeJson(stdout: string): ClaudeRunResult {
+  const lines = stdout.trim().split('\n').reverse();
+  for (const line of lines) {
+    try {
+      const o = JSON.parse(line) as { session_id?: unknown; result?: unknown; is_error?: unknown };
+      if (o && typeof o === 'object' && ('session_id' in o || 'result' in o)) {
+        return { sessionId: String(o.session_id ?? ''), result: String(o.result ?? ''), isError: Boolean(o.is_error) };
+      }
+    } catch {
+      // not the result line
+    }
+  }
+  throw new Error(`unparseable claude output: ${stdout.slice(-300)}`);
+}
+
+export function createClaudeRunner(bin = 'claude'): ClaudeRunner {
+  return (opts) =>
+    new Promise((resolve, reject) => {
+      const env = { ...process.env };
+      for (const k of STRIPPED_ENV) delete env[k];
+      const child = spawn(bin, buildClaudeArgs(opts), { cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      const timer = opts.timeoutMs
+        ? setTimeout(() => {
+            child.kill('SIGTERM');
+            reject(new Error(`claude timed out after ${opts.timeoutMs}ms`));
+          }, opts.timeoutMs)
+        : undefined;
+      child.stdout.on('data', (d: Buffer) => {
+        if (stdout.length < STDOUT_CAP) stdout += d.toString('utf8');
+      });
+      child.stderr.on('data', (d: Buffer) => {
+        stderr = (stderr + d.toString('utf8')).slice(-4000);
+      });
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        try {
+          resolve(parseClaudeJson(stdout));
+        } catch (err) {
+          reject(new Error(`claude exited ${code}: ${stderr.trim().slice(-500) || (err as Error).message}`));
+        }
+      });
+      child.stdin.end(opts.prompt);
+    });
+}

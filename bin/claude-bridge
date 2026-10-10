@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Claude Code session that receives agent-bridge messages live (channel push).
+set -euo pipefail
+export BRIDGE_LIVE=1
+exec claude --dangerously-load-development-channels server:agent-bridge "$@"
