@@ -18,6 +18,7 @@ interface Side {
   calls: ClaudeRunOptions[];
   sessions: SessionCandidate[];
   sessionQueries: string[][];
+  notifications: string[];
   classifierAnswer: string;
   runnerError?: Error;
   down: boolean;
@@ -45,11 +46,18 @@ describe('agent-bridge daemon', () => {
       calls: [],
       sessions: [],
       sessionQueries: [],
+      notifications: [],
       classifierAnswer: '{"session_id":null}',
       down: false,
     } as unknown as Side;
     for (const p of peers) {
-      side.store.upsertPeer({ name: p.name, url: `http://${p.name}.test`, token: pairToken(name, p.name), folders: p.folders ?? ['/w/shared'] });
+      side.store.upsertPeer({
+        name: p.name,
+        url: `http://${p.name}.test`,
+        token: pairToken(name, p.name),
+        folders: p.folders ?? ['/w/shared'],
+        remoteFolders: [],
+      });
     }
     side.daemon = createDaemon({
       name,
@@ -64,6 +72,7 @@ describe('agent-bridge daemon', () => {
       activeWindowMs: 10 * 60_000,
       now: () => NOW,
       log: () => {},
+      notify: (title: string) => side.notifications.push(title),
       fetchImpl: async (url, init) => {
         if (side.down) throw new Error('ECONNREFUSED');
         const target = net.get(new URL(url).hostname.replace(/\.test$/, ''));
@@ -260,16 +269,16 @@ describe('agent-bridge daemon', () => {
       expect(m.store.undeliveredReplies().map((x) => x.text)).toEqual(['anh trả lời']);
     });
   });
-  describe('pairing', () => {
+  describe('connecting', () => {
     let fa: string;
     let fb: string;
-    const local = async (side: Side, path: string, body: unknown) => {
+    const call = async (side: Side, path: string, body?: unknown) => {
       const res = await side.daemon.localApp.request(path, {
-        method: 'POST',
+        method: body === undefined ? 'GET' : 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+        body: body === undefined ? undefined : JSON.stringify(body),
       });
-      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+      return { status: res.status, body: (await res.json()) as Record<string, any> };
     };
 
     beforeEach(() => {
@@ -280,17 +289,33 @@ describe('agent-bridge daemon', () => {
       mkdirSync(join(fb, 'sub'));
       a = addSide('anh', []);
       b = addSide('cu', []);
+      a.store.removePeer('cu'); // the outer beforeEach pre-connected them in the same db files
+      b.store.removePeer('anh');
     });
 
-    it('invite + accept connects both sides, each with the folders its own user chose', async () => {
-      const inv = await local(a, '/local/invite', { folders: [fa] });
-      expect(inv.status).toBe(200);
-      const acc = await local(b, '/local/accept', { code: inv.body.code, folders: [fb, join(fb, 'sub/')] });
-      expect(acc).toMatchObject({ status: 200, body: { peer: 'anh' } });
+    const requestFromA = async () => {
+      const r = await call(a, '/local/connect', { url: 'http://cu.test', folders: [fa] });
+      expect(r.status).toBe(200);
+      expect(r.body.peer).toBe('cu');
+      return String(r.body.request_id);
+    };
 
-      expect(a.store.getPeer('cu')).toMatchObject({ url: 'http://cu.test', folders: [fa] });
-      expect(b.store.getPeer('anh')).toMatchObject({ url: 'http://anh.test', folders: [fb, join(fb, 'sub')] });
+    it('request → notify → accept connects both sides with the folders each user chose', async () => {
+      const id = await requestFromA();
+      expect(b.notifications.join()).toMatch(/anh/);
+
+      const incoming = await call(b, '/local/requests');
+      expect(incoming.body.incoming).toEqual([expect.objectContaining({ id, name: 'anh', folders: [fa] })]);
+      expect(JSON.stringify(incoming.body)).not.toMatch(/secret/);
+
+      const ok = await call(b, '/local/requests/answer', { request_id: id, accept: true, folders: [fb, join(fb, 'sub/')] });
+      expect(ok).toMatchObject({ status: 200, body: { peer: 'anh' } });
+
+      expect((await call(a, `/local/requests/${id}`)).body).toMatchObject({ status: 'accepted', name: 'cu', remote_folders: [fb, join(fb, 'sub')] });
+      expect(a.store.getPeer('cu')).toMatchObject({ url: 'http://cu.test', folders: [fa], remoteFolders: [fb, join(fb, 'sub')] });
+      expect(b.store.getPeer('anh')).toMatchObject({ url: 'http://anh.test', folders: [fb, join(fb, 'sub')], remoteFolders: [fa] });
       expect(a.store.getPeer('cu')!.token).toBe(b.store.getPeer('anh')!.token);
+      expect(a.notifications.join()).toMatch(/cu/);
 
       const got = liveInbox(a, 'a-conn', undefined, fa);
       await a.daemon.send({ kind: 'ask', text: 'hello', connId: 'a-conn' });
@@ -299,29 +324,47 @@ describe('agent-bridge daemon', () => {
       expect(got.map((m) => m.text)).toEqual(['cu#1']);
     });
 
-    it('an invite code works once', async () => {
-      const inv = await local(a, '/local/invite', { folders: [fa] });
-      await local(b, '/local/accept', { code: inv.body.code, folders: [fb] });
-      const again = await local(b, '/local/accept', { code: inv.body.code, folders: [fb] });
-      expect(again.status).toBe(400);
-      expect(String(again.body.error)).toMatch(/đã được dùng/);
+    it('decline leaves both sides unconnected', async () => {
+      const id = await requestFromA();
+      expect((await call(b, '/local/requests/answer', { request_id: id, accept: false })).status).toBe(200);
+      expect((await call(a, `/local/requests/${id}`)).body.status).toBe('declined');
+      expect(a.store.listPeers()).toEqual([]);
+      expect(b.store.listPeers()).toEqual([]);
     });
 
-    it('refuses folders that do not exist and codes created by yourself', async () => {
-      expect((await local(a, '/local/invite', { folders: [join(fa, 'missing')] })).status).toBe(400);
-      expect((await local(a, '/local/invite', { folders: [] })).status).toBe(400);
-      const inv = await local(a, '/local/invite', { folders: [fa] });
-      expect((await local(a, '/local/accept', { code: inv.body.code, folders: [fa] })).status).toBe(400);
+    it('accepting while the requester is offline fails and keeps the request pending for a retry', async () => {
+      const id = await requestFromA();
+      a.down = true;
+      expect((await call(b, '/local/requests/answer', { request_id: id, accept: true, folders: [fb] })).status).toBe(502);
+      expect(b.store.listPeers()).toEqual([]);
+      a.down = false;
+      expect((await call(b, '/local/requests/answer', { request_id: id, accept: true, folders: [fb] })).status).toBe(200);
+      expect(a.store.getPeer('cu')).toBeDefined();
+    });
+
+    it('rejects an answer that does not carry the request secret', async () => {
+      const id = await requestFromA();
+      const forged = await a.daemon.peerApp.request('/connect/answer', {
+        method: 'POST',
+        body: JSON.stringify({ request_id: id, secret: 'f'.repeat(64), accepted: true, name: 'cu', folders: [] }),
+      });
+      expect(forged.status).toBe(403);
+      expect(a.store.listPeers()).toEqual([]);
+    });
+
+    it('refuses bad folders, yourself, and hosts that are not agent-bridge', async () => {
+      expect((await call(a, '/local/connect', { url: 'http://cu.test', folders: [join(fa, 'missing')] })).status).toBe(400);
+      expect((await call(a, '/local/connect', { url: 'http://anh.test', folders: [fa] })).status).toBe(400);
+      expect((await call(a, '/local/connect', { url: 'http://nobody.test', folders: [fa] })).status).toBe(502);
     });
 
     it('lists, re-scopes and removes peers', async () => {
-      const inv = await local(a, '/local/invite', { folders: [fa] });
-      await local(b, '/local/accept', { code: inv.body.code, folders: [fb] });
-      const list = await a.daemon.localApp.request('/local/peers');
-      expect(await list.json()).toEqual({ peers: [{ name: 'cu', url: 'http://cu.test', folders: [fa] }] });
-      expect((await local(a, '/local/peers/folders', { name: 'cu', folders: [fb] })).status).toBe(200);
+      const id = await requestFromA();
+      await call(b, '/local/requests/answer', { request_id: id, accept: true, folders: [fb] });
+      expect((await call(a, '/local/peers')).body).toEqual({ peers: [{ name: 'cu', url: 'http://cu.test', folders: [fa], remote_folders: [fb] }] });
+      expect((await call(a, '/local/peers/folders', { name: 'cu', folders: [fb] })).status).toBe(200);
       expect(a.store.getPeer('cu')!.folders).toEqual([fb]);
-      expect((await local(a, '/local/peers/remove', { name: 'cu' })).status).toBe(200);
+      expect((await call(a, '/local/peers/remove', { name: 'cu' })).status).toBe(200);
       expect(a.store.listPeers()).toEqual([]);
     });
   });

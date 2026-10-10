@@ -62,13 +62,13 @@ describe('BridgeStore', () => {
     expect(store.outbox()).toEqual([]);
   });
 
-  it('stores peers with their folders and replaces on re-pair', () => {
-    store.upsertPeer({ name: 'cu', url: 'http://a:8790', token: 't1', folders: ['/w/a'] });
-    store.upsertPeer({ name: 'minh', url: 'http://b:8790', token: 't2', folders: ['/w/b', '/w/c'] });
-    store.upsertPeer({ name: 'cu', url: 'http://a2:8790', token: 't3', folders: ['/w/a'] });
+  it('stores peers with what each side may read, and replaces on reconnect', () => {
+    store.upsertPeer({ name: 'cu', url: 'http://a:8790', token: 't1', folders: ['/w/a'], remoteFolders: ['/c/x'] });
+    store.upsertPeer({ name: 'minh', url: 'http://b:8790', token: 't2', folders: ['/w/b', '/w/c'], remoteFolders: [] });
+    store.upsertPeer({ name: 'cu', url: 'http://a2:8790', token: 't3', folders: ['/w/a'], remoteFolders: ['/c/y'] });
     expect(store.listPeers()).toEqual([
-      { name: 'cu', url: 'http://a2:8790', token: 't3', folders: ['/w/a'] },
-      { name: 'minh', url: 'http://b:8790', token: 't2', folders: ['/w/b', '/w/c'] },
+      { name: 'cu', url: 'http://a2:8790', token: 't3', folders: ['/w/a'], remoteFolders: ['/c/y'] },
+      { name: 'minh', url: 'http://b:8790', token: 't2', folders: ['/w/b', '/w/c'], remoteFolders: [] },
     ]);
     expect(store.setPeerFolders('minh', ['/w/z'])).toBe(true);
     expect(store.getPeer('minh')?.folders).toEqual(['/w/z']);
@@ -77,12 +77,15 @@ describe('BridgeStore', () => {
     expect(store.listPeers().map((p) => p.name)).toEqual(['minh']);
   });
 
-  it('consumes an invite exactly once and refuses expired ones', () => {
-    store.createInvite('h1', ['/w/a'], 1_000);
-    store.createInvite('h2', ['/w/b'], 1_000);
-    expect(store.takeInvite('h1', 500)).toEqual({ ok: true, folders: ['/w/a'] });
-    expect(store.takeInvite('h1', 500)).toEqual({ ok: false, reason: 'used' });
-    expect(store.takeInvite('h2', 2_000)).toEqual({ ok: false, reason: 'expired' });
-    expect(store.takeInvite('nope', 500)).toEqual({ ok: false, reason: 'unknown' });
+  it('tracks connect requests; a new incoming request from the same name replaces the pending one', () => {
+    const base = { url: 'http://x:8790', secret: 's', folders: ['/f'], status: 'pending' as const };
+    store.saveRequest({ ...base, id: 'r1', direction: 'in', name: 'cu', identity: 'cu@gmail.com' });
+    store.saveRequest({ ...base, id: 'r2', direction: 'in', name: 'cu' });
+    store.saveRequest({ ...base, id: 'r3', direction: 'out', name: 'minh' });
+    expect(store.listRequests('in', 'pending').map((r) => r.id)).toEqual(['r2']);
+    expect(store.getRequest('r3')).toMatchObject({ direction: 'out', name: 'minh', folders: ['/f'], status: 'pending' });
+    store.setRequestStatus('r3', 'accepted');
+    expect(store.getRequest('r3')?.status).toBe('accepted');
+    expect(store.listRequests('out', 'pending')).toEqual([]);
   });
 });

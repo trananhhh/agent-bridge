@@ -1,14 +1,21 @@
 import { serve } from '@hono/node-server';
+import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createClaudeRunner } from './claude-runner.ts';
-import { DB_PATH, loadConfig } from './config.ts';
+import { DB_PATH, VERSION, loadConfig } from './config.ts';
 import { createDaemon } from './daemon.ts';
 import { listRecentSessions } from './sessions.ts';
 import { BridgeStore } from './store.ts';
+import { tailscaleWhois } from './tailscale.ts';
 
 const OUTBOX_INTERVAL_MS = 30_000;
 const PROJECTS_ROOT = join(homedir(), '.claude', 'projects');
+
+function notify(title: string, body: string): void {
+  if (process.platform !== 'darwin') return;
+  execFile('osascript', ['-e', `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`], () => {});
+}
 
 export async function runDaemon(): Promise<void> {
   const cfg = loadConfig();
@@ -18,6 +25,7 @@ export async function runDaemon(): Promise<void> {
   const daemon = createDaemon({
     name: cfg.name,
     publicUrl,
+    version: VERSION,
     store,
     runner: createClaudeRunner(cfg.claudeBin),
     listSessions: (allowedDirs) =>
@@ -25,6 +33,8 @@ export async function runDaemon(): Promise<void> {
     headlessTimeoutMs: cfg.headlessTimeoutMs,
     activeWindowMs: cfg.routing.activeWindowMin * 60_000,
     classifierModel: cfg.routing.classifierModel,
+    whois: tailscaleWhois,
+    notify,
   });
 
   const peerServer = serve({ fetch: daemon.peerApp.fetch, hostname: cfg.listenHost, port: cfg.peerPort });
@@ -36,11 +46,10 @@ export async function runDaemon(): Promise<void> {
   console.error(
     JSON.stringify({
       event: 'started',
+      version: VERSION,
       name: cfg.name,
-      peer: `${cfg.listenHost}:${cfg.peerPort}`,
-      local: `127.0.0.1:${cfg.localPort}`,
       url: publicUrl,
-      peers: store.listPeers().map((p) => `${p.name}=${p.url} [${p.folders.join(', ')}]`),
+      peers: store.listPeers().map((p) => `${p.name} [${p.folders.join(', ')}]`),
     }),
   );
 

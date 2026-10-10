@@ -1,68 +1,81 @@
 # agent-bridge
 
-Cho bot Claude Code của bạn nói chuyện trực tiếp với bot Claude Code của đồng nghiệp, mỗi người một máy. Bot của bạn cần check gì bên máy đồng nghiệp thì hỏi thẳng bot bên đó, và ngược lại.
+Cho agent Claude Code của bạn hỏi thẳng agent Claude Code của đồng nghiệp (máy khác, account khác), và ngược lại. Kết nối peer-to-peer qua Tailscale, không có server trung gian.
 
-## Dùng thế nào
+## Cài (mỗi người, một lần)
 
-1. **Cài Tailscale** và đăng nhập ([tailscale.com/download](https://tailscale.com/download)).
-2. **Cài agent-bridge**: nói với Claude Code *"Setup agent-bridge theo https://github.com/trananhhh/agent-bridge/blob/main/SETUP.md"*.
-3. **Kết nối**: nói với Claude *"kết nối với Cừ"*. Claude hỏi bạn chọn folder Cừ được xem, rồi đưa bạn một mã `ab1_…` để gửi cho Cừ. Cừ dán mã vào Claude của họ, chọn folder bạn được xem, bấm **Allow**. Xong.
-4. Từ đó cứ nói tự nhiên: *"hỏi bot của Cừ xem bảng orders có cột provider_id không"*.
+**1. Tailscale.** Cài app tại https://tailscale.com/download, đăng nhập bằng account của bạn.
+
+**2. Share máy cho nhau, cả hai chiều.** Mỗi người làm:
+1. Mở https://login.tailscale.com/admin/machines
+2. Ở dòng máy của mình, bấm `⋯` → **Share…** → copy share link (hoặc nhập email người kia)
+3. Gửi link cho người kia; họ mở link và bấm **Accept**
+
+Phải share cả hai chiều, vì Tailscale chỉ cho máy được share *nhận* kết nối chứ không cho nó *chủ động gọi lại*. Kiểm tra: `tailscale status` thấy máy người kia là được.
+
+**3. Cài agent-bridge.** Cần Node ≥ 22.13 và Claude Code.
+
+```bash
+npm install -g github:trananhhh/agent-bridge
+agent-bridge
+```
+
+Lần đầu chạy, CLI hỏi tên của bạn rồi tự cài daemon chạy nền (tự bật khi đăng nhập) và đăng ký MCP cho Claude Code. Nếu macOS hỏi *"Allow node to accept incoming connections"* → bấm **Allow**.
+
+## Kết nối
+
+**Người mời** chạy `agent-bridge`:
+1. CLI quét Tailscale và liệt kê những máy đang chạy agent-bridge; chọn người cần kết nối.
+2. Chọn folder người đó được **đọc**.
+3. Gửi yêu cầu rồi chờ.
+
+**Người được mời** nhận thông báo trên macOS, chạy `agent-bridge`:
+1. CLI hiện ai đang mời, kèm danh tính Tailscale thật (không phải tên tự khai) và folder họ chia sẻ.
+2. Chấp nhận, rồi chọn folder người mời được **đọc**.
+
+Xong thì **cả hai** CLI đều in ra một đoạn hướng dẫn (đã tự copy vào clipboard). Dán đoạn đó vào Claude Code để agent lưu vào memory: nó nói chuyện được với ai, hỏi về folder nào, và dùng tool gì.
+
+## Dùng
+
+Cứ nói tự nhiên với Claude Code: *"hỏi agent của Cừ xem bảng orders có cột provider_id không"*.
+
+- **Muốn tin của đồng nghiệp tự hiện trong conversation đang mở:** mở Claude bằng `claude-bridge` thay cho `claude`. Lệnh này thêm flag `--dangerously-load-development-channels`, và mỗi lần mở phải xác nhận một cảnh báo, vì [Channels](https://code.claude.com/docs/en/channels-reference) của Claude Code đang research preview.
+- **Session thường hoặc desktop app:** vẫn dùng được; Claude tự gọi `peer_inbox` để chờ câu trả lời.
+- **Đồng nghiệp hỏi lúc bạn không mở session nào:** daemon tự mở một session chỉ đọc để trả lời. Nếu câu hỏi liên quan một session gần đây (48h) thì tiếp tục ngay trong session đó.
 
 ## Quyền
 
-- Mỗi kết nối, **mỗi bên tự chọn** 1 hoặc nhiều folder mà bot bên kia được **đọc**.
-- Bot bên kia hỏi lúc bạn vắng: Claude mở một session **chỉ đọc**, bị khoá trong đúng các folder đó bằng `claude --restricted --add-dir <folder>`. Ở chế độ này Write/Edit/Bash không tồn tại, và đọc ngoài folder bị chặn ở mức tool, không phụ thuộc model có tự giác hay không.
-- Cần ghi/sửa/chạy lệnh → bot trả lời rằng chủ máy phải tự duyệt. Trong session bạn đang mở, Claude Code vẫn hỏi bạn trước mọi thao tác ghi như bình thường.
-- Bot bên kia đọc được **mọi thứ** trong folder bạn chọn, kể cả `.env`. Chỉ chọn những gì bạn sẵn sàng chia sẻ.
+- Mỗi kết nối, mỗi bên tự chọn folder bên kia được đọc. Đọc được **mọi thứ** trong đó, kể cả `.env`.
+- Session trả lời đồng nghiệp chạy bằng `claude --restricted --add-dir <folder>`: không có Write/Edit/Bash, và đọc ngoài folder bị CLI chặn. Đã kiểm chứng ở mức tool, không phụ thuộc model có tự giác hay không.
+- Cần ghi/sửa → agent trả lời rằng chủ máy phải tự làm. Trong session bạn đang mở, Claude Code vẫn hỏi bạn trước mọi thao tác ghi.
 
-## Câu hỏi đến được trả lời ở đâu
+## Lệnh
 
-| Tin đến | Đi vào |
+```
+agent-bridge                 wizard: setup → xử lý yêu cầu đang chờ → kết nối người mới
+agent-bridge connect [ip]    kết nối (nhập IP Tailscale nếu quét không thấy)
+agent-bridge requests        chấp nhận / từ chối yêu cầu đang chờ
+agent-bridge peers           ai đã kết nối, mỗi bên đọc được gì
+agent-bridge note <tên>      in lại đoạn hướng dẫn cho Claude Code
+agent-bridge folders <tên>   đổi folder người đó được đọc
+agent-bridge remove <tên>    ngắt kết nối
+agent-bridge status          daemon + từng kết nối online/offline
+agent-bridge uninstall       tắt daemon, gỡ MCP
+```
+
+## Gỡ rối
+
+| Triệu chứng | Kiểm tra |
 |---|---|
-| Câu trả lời cho câu bạn hỏi | Session đã hỏi (tự hiện trong conversation nếu mở bằng `claude-bridge`). Session đã đóng → giữ lại, giao khi mở lại hoặc khi bot gọi `peer_inbox` |
-| Hỏi tiếp cùng mạch | Đúng session đã trả lời lần trước |
-| Câu hỏi mới | Haiku chọn session gần đây (48h) liên quan nhất **trong các folder đã chia sẻ** → nhắn vào đó (fork nếu session vừa hoạt động <10 phút). Không có → tạo session mới |
+| `connect` không thấy ai | Đã share Tailscale **hai chiều** chưa (`tailscale status`)? Bên kia đã chạy `agent-bridge` lần đầu chưa? |
+| Thấy máy nhưng không gửi/nhận được | Firewall macOS chặn `node` → System Settings → Network → Firewall → Options |
+| Đồng nghiệp hỏi mà không ai trả lời | `agent-bridge status` trên máy họ; log ở `~/.agent-bridge/daemon.log` |
 
-## Hai cách mở Claude Code
-
-- **`~/Coding/agent-bridge/bin/claude-bridge`** (thay cho `claude`): tin của đồng nghiệp **tự hiện trong conversation**. Lần đầu mỗi phiên phải xác nhận một cảnh báo "development channels", vì [Channels](https://code.claude.com/docs/en/channels-reference) của Claude Code đang research preview.
-- **Bình thường** (`claude`, desktop app): mọi tool vẫn dùng được, chỉ là câu trả lời không tự hiện; Claude tự gọi `peer_inbox` để chờ.
-
-## Kết nối mạng
-
-Daemon nghe trên IP Tailscale (port 8790), ngoài tailnet không ai vào được. Hai máy phải "thấy" nhau trong Tailscale:
-- **Cùng một tailnet** (khuyên dùng cho team): admin mời từng người vào tailnet, người đó bấm accept 1 lần là thấy được cả team.
-- **Khác tailnet**: mỗi người share máy mình cho người kia (admin console → Machines → `…` → Share), bên kia bấm accept.
-
-## Lệnh (Claude chạy hộ; bạn hiếm khi cần gõ)
-
-```
-bin/agent-bridge setup --name <tên>     cài 1 lần: config + daemon nền (launchd) + MCP cho Claude Code
-bin/agent-bridge invite --folder <dir>...         tạo mã mời
-bin/agent-bridge accept <ab1_…> --folder <dir>... nhận mã mời
-bin/agent-bridge peers | status
-bin/agent-bridge folders <peer> --folder <dir>... đổi folder peer được xem
-bin/agent-bridge remove-peer <peer>
-bin/agent-bridge uninstall
-```
-
-Tool MCP Claude dùng: `create_invite`, `accept_invite`, `list_peers`, `set_peer_folders`, `remove_peer`, `ask_peer`, `reply`, `peer_inbox`.
-
-## Vận hành
-
-- Dữ liệu: `~/.agent-bridge/` gồm `config.json`, `bridge.db` (peers, lịch sử tin, outbox) và `daemon.log` (mỗi event một dòng JSON).
-- Mã mời dùng 1 lần, hết hạn sau 24h. Token của từng cặp được sinh ra từ mã mời, không cần copy tay.
-- Peer offline → tin xếp hàng, tự gửi lại mỗi 30s.
-- Session tự chạy lỗi/quá 15 phút → vẫn trả lời báo lỗi để bên hỏi không bị treo.
-- Chi phí: mỗi câu hỏi mới tốn 1 lần chạy haiku và 1 session trả lời, tính vào account của **bên trả lời**.
-
-## Yêu cầu
-
-macOS (Linux chạy được nhưng tự lo supervisor), Node ≥ 22.18, Claude Code ≥ 2.1.80 đăng nhập claude.ai, Tailscale.
+Dữ liệu nằm trong `~/.agent-bridge/`, gồm `config.json`, `bridge.db` (kết nối, lịch sử tin, hàng đợi) và `daemon.log`. Peer đang offline thì tin xếp hàng và tự gửi lại khi họ online. Chi phí trả lời tính vào account Claude của **bên trả lời**.
 
 ## Phát triển
 
 ```bash
 npm install && npm test && npm run typecheck
+npm run build   # dist/ được commit để `npm i -g github:…` không cần build — build trước khi commit
 ```

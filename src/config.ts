@@ -1,8 +1,12 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
+/** Package root — works from src/ (dev) and dist/ (installed). */
+export const PACKAGE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const VERSION = (JSON.parse(readFileSync(join(PACKAGE_DIR, 'package.json'), 'utf8')) as { version: string }).version;
 export const BRIDGE_HOME = process.env.BRIDGE_HOME ?? join(homedir(), '.agent-bridge');
 export const CONFIG_PATH = join(BRIDGE_HOME, 'config.json');
 export const DB_PATH = join(BRIDGE_HOME, 'bridge.db');
@@ -46,7 +50,7 @@ export function parseConfig(raw: unknown): BridgeConfig {
 }
 
 export function readRawConfig(path = CONFIG_PATH): RawConfig {
-  if (!existsSync(path)) throw new Error(`Chưa setup (${path} không tồn tại). Chạy: agent-bridge setup --name <tên>`);
+  if (!existsSync(path)) throw new Error(`Chưa setup (${path} không tồn tại). Chạy: agent-bridge setup`);
   return JSON.parse(readFileSync(path, 'utf8')) as RawConfig;
 }
 

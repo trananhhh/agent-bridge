@@ -1,18 +1,22 @@
 {
-  "name": "agent-bridge",
-  "version": "0.1.0",
+  "name": "@trananhhh/agent-bridge",
+  "version": "0.2.0",
   "private": true,
-  "description": "Let Claude Code bots on different machines talk to each other (peer-to-peer over Tailscale).",
+  "description": "Let Claude Code agents on different machines talk to each other over Tailscale",
   "type": "module",
-  "engines": { "node": ">=22.18" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "bin": {
     "agent-bridge": "bin/agent-bridge",
     "claude-bridge": "bin/claude-bridge"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
@@ -24,5 +28,16 @@
     "@types/node": "^22.13.14",
     "typescript": "^5.8.2",
     "vitest": "^3.1.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trananhhh/agent-bridge.git"
+  },
+  "license": "MIT",
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "SETUP.md"
+  ]
 }

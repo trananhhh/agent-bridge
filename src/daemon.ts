@@ -1,23 +1,28 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
+import { getConnInfo } from '@hono/node-server/conninfo';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import type { ClaudeRunner } from './claude-runner.ts';
 import { expandPath } from './config.ts';
-import { decodeInvite, encodeInvite } from './invite.ts';
 import { PeerMessageSchema, type MessageKind, type PeerMessage } from './protocol.ts';
 import { buildClassifierPrompt, parseClassifierOutput, resolveTarget, routeInbound, type ClassifierCandidate, type Target } from './router.ts';
 import { isWithin, type SessionCandidate } from './sessions.ts';
-import type { BridgeStore, PeerRecord } from './store.ts';
+import type { BridgeStore, ConnectRequest, PeerRecord } from './store.ts';
 
 /** Peer `folders`: the only directories this peer's questions may be answered from (read-only). First one hosts new sessions. */
 type DaemonPeer = PeerRecord;
 
 export interface DaemonOptions {
   name: string;
-  /** How peers reach this daemon (http://<tailscale-ip>:<port>); embedded in invite codes. */
+  /** How peers reach this daemon: http://<tailscale-ip>:<port>. */
   publicUrl: string;
+  version?: string;
+  /** Tailscale identity of a tailnet IP (login + machine), shown when someone asks to connect. */
+  whois?: (ip: string) => Promise<string | undefined>;
+  /** Desktop notification for the owner (connect requests / acceptances). */
+  notify?: (title: string, body: string) => void;
   store: BridgeStore;
   runner: ClaudeRunner;
   listSessions: (allowedDirs: string[]) => SessionCandidate[];
@@ -63,7 +68,7 @@ export interface Daemon {
 }
 
 const PEER_TIMEOUT_MS = 10_000;
-const INVITE_TTL_MS = 24 * 3600_000;
+const MAX_PENDING_REQUESTS = 20;
 const PEER_NAME = /^[a-z0-9_-]{1,50}$/;
 const CLASSIFIER_TIMEOUT_MS = 120_000;
 
@@ -109,7 +114,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     const fromThread = input.threadId ? store.getThread(input.threadId)?.peer : undefined;
     const names = peerNames();
     const name = fromThread ?? input.to ?? (names.length === 1 ? names[0] : undefined);
-    if (!name) throw new Error(names.length ? `"to" is required: pick one of ${names.join(', ')}` : 'chưa kết nối với ai (tạo mã mời bằng create_invite)');
+    if (!name) throw new Error(names.length ? `"to" is required: pick one of ${names.join(', ')}` : 'chưa kết nối với ai (chạy `agent-bridge connect` trong terminal)');
     const peer = store.getPeer(name);
     if (!peer) throw new Error(`unknown peer "${name}"; connected: ${names.join(', ') || '(none)'}`);
     return peer;
@@ -292,7 +297,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
   }
 
   const peerApp = new Hono();
-  peerApp.get('/health', (c) => c.json({ ok: true, name: opts.name }));
+  peerApp.get('/health', (c) => c.json({ ok: true, app: 'agent-bridge', name: opts.name, version: opts.version }));
   peerApp.post('/inbox', async (c) => {
     const peer = peerForToken(c.req.header('authorization'), store.listPeers());
     if (!peer) return c.json({ error: 'unauthorized' }, 401);
@@ -304,71 +309,149 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     return c.json({ accepted: true }, 202);
   });
 
-  peerApp.post('/pair', async (c) => {
-    const body = (await c.req.json().catch(() => null)) as { secret?: unknown; name?: unknown; url?: unknown } | null;
-    const secret = typeof body?.secret === 'string' ? body.secret : '';
-    const name = typeof body?.name === 'string' ? body.name : '';
-    const url = typeof body?.url === 'string' ? body.url : '';
-    if (!secret || !PEER_NAME.test(name) || !URL.canParse(url)) return c.json({ error: 'invalid pairing request' }, 400);
-    if (name === opts.name) return c.json({ error: `bên kia cũng tên "${name}" — hai người phải khác tên` }, 409);
-    const taken = store.takeInvite(hashSecret(secret), now());
-    if (!taken.ok) {
-      const reason = { unknown: 'mã mời không tồn tại (bên mời có thể đã cài lại)', used: 'mã mời đã được dùng', expired: 'mã mời đã hết hạn (24h)' }[taken.reason];
-      return c.json({ error: reason }, 410);
+  // Someone asks to connect. Nothing is trusted until the owner accepts locally.
+  peerApp.post('/connect', async (c) => {
+    const parsed = z
+      .object({
+        request_id: z.string().min(1).max(100),
+        name: z.string().regex(PEER_NAME),
+        url: z.url(),
+        secret: z.string().regex(/^[a-f0-9]{64}$/),
+        folders: z.array(z.string().max(1000)).max(50),
+      })
+      .safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: 'invalid connect request' }, 400);
+    const r = parsed.data;
+    if (r.name === opts.name) return c.json({ error: `hai người không được trùng tên "${r.name}"` }, 409);
+    if (store.listRequests('in', 'pending').length >= MAX_PENDING_REQUESTS) return c.json({ error: 'too many pending requests' }, 429);
+    const ip = remoteIp(c);
+    const url = ip ? `http://${ip}:${new URL(r.url).port || '8790'}` : r.url;
+    const identity = ip && opts.whois ? await opts.whois(ip).catch(() => undefined) : undefined;
+    store.saveRequest({ id: r.request_id, direction: 'in', name: r.name, url, secret: r.secret, folders: r.folders, identity, status: 'pending' });
+    log('connect_request', { from: r.name, identity, url });
+    opts.notify?.(`${r.name} muốn kết nối agent-bridge`, `${identity ?? url} — chạy "agent-bridge" trong terminal để chấp nhận`);
+    return c.json({ name: opts.name }, 202);
+  });
+
+  // The other side answered our request.
+  peerApp.post('/connect/answer', async (c) => {
+    const body = (await c.req.json().catch(() => null)) as
+      | { request_id?: unknown; secret?: unknown; accepted?: unknown; folders?: unknown }
+      | null;
+    const req = typeof body?.request_id === 'string' ? store.getRequest(body.request_id) : undefined;
+    if (!req || req.direction !== 'out' || typeof body?.secret !== 'string' || !safeEqual(body.secret, req.secret)) {
+      return c.json({ error: 'unknown request' }, 403);
     }
-    store.upsertPeer({ name, url, token: secret, folders: taken.folders });
-    log('paired', { peer: name, url, folders: taken.folders });
-    return c.json({ name: opts.name });
+    if (req.status !== 'pending') return c.json({ ok: true, status: req.status });
+    if (body.accepted !== true) {
+      store.setRequestStatus(req.id, 'declined');
+      log('connect_declined', { peer: req.name });
+      opts.notify?.(`${req.name} đã từ chối kết nối`, '');
+      return c.json({ ok: true });
+    }
+    const remoteFolders = Array.isArray(body.folders) ? body.folders.filter((f): f is string => typeof f === 'string') : [];
+    store.upsertPeer({ name: req.name, url: req.url, token: req.secret, folders: req.folders, remoteFolders });
+    store.setRequestStatus(req.id, 'accepted', remoteFolders);
+    log('connected', { peer: req.name, folders: req.folders, remote_folders: remoteFolders });
+    opts.notify?.(`${req.name} đã chấp nhận kết nối`, `chạy "agent-bridge note ${req.name}" để lấy đoạn hướng dẫn cho Claude`);
+    return c.json({ ok: true });
   });
 
   const localApp = new Hono();
   const FoldersSchema = z.array(z.string().min(1)).min(1, 'chọn ít nhất 1 folder');
   const PeerNameSchema = z.string().regex(PEER_NAME);
 
-  localApp.post('/local/invite', async (c) => {
-    const parsed = z.object({ folders: FoldersSchema }).safeParse(await c.req.json().catch(() => null));
+  localApp.post('/local/connect', async (c) => {
+    const parsed = z.object({ url: z.url(), folders: FoldersSchema }).safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'invalid' }, 400);
     const folders = checkFolders(parsed.data.folders);
     if (typeof folders === 'string') return c.json({ error: folders }, 400);
-    const secret = randomBytes(32).toString('hex');
-    const expiresAt = now() + INVITE_TTL_MS;
-    store.createInvite(hashSecret(secret), folders, expiresAt);
-    log('invite_created', { folders });
-    return c.json({ code: encodeInvite({ name: opts.name, url: opts.publicUrl, secret }), folders, expires_at: new Date(expiresAt).toISOString() });
-  });
-
-  localApp.post('/local/accept', async (c) => {
-    const parsed = z.object({ code: z.string().min(1), folders: FoldersSchema }).safeParse(await c.req.json().catch(() => null));
-    if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'invalid' }, 400);
-    const folders = checkFolders(parsed.data.folders);
-    if (typeof folders === 'string') return c.json({ error: folders }, 400);
-    let invite;
+    const url = parsed.data.url.replace(/\/$/, '');
+    let peerName: string;
     try {
-      invite = decodeInvite(parsed.data.code);
+      const health = (await (await fetchImpl(`${url}/health`, { signal: AbortSignal.timeout(PEER_TIMEOUT_MS) })).json()) as { app?: string; name?: string };
+      if (health.app !== 'agent-bridge' || !health.name) return c.json({ error: `${url} không phải agent-bridge` }, 400);
+      peerName = health.name;
     } catch (err) {
-      return c.json({ error: (err as Error).message }, 400);
+      return c.json({ error: `không kết nối được ${url}: ${(err as Error).message}` }, 502);
     }
-    if (invite.name === opts.name) return c.json({ error: 'đây là mã mời do chính bạn tạo — gửi nó cho người kia' }, 400);
-    let res: Response;
+    if (peerName === opts.name) return c.json({ error: 'đó là chính máy bạn (hoặc người kia trùng tên bạn)' }, 400);
+    const request = { id: randomUUID(), direction: 'out' as const, name: peerName, url, secret: randomBytes(32).toString('hex'), folders, status: 'pending' as const };
+    store.saveRequest(request);
     try {
-      res = await fetchImpl(`${invite.url.replace(/\/$/, '')}/pair`, {
+      const res = await fetchImpl(`${url}/connect`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ secret: invite.secret, name: opts.name, url: opts.publicUrl }),
+        body: JSON.stringify({ request_id: request.id, name: opts.name, url: opts.publicUrl, secret: request.secret, folders }),
         signal: AbortSignal.timeout(PEER_TIMEOUT_MS),
       });
+      if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error ?? `HTTP ${res.status}`);
     } catch (err) {
-      return c.json({ error: `không kết nối được tới ${invite.name} (${invite.url}): ${(err as Error).message}. Kiểm tra Tailscale (hai máy thấy nhau chưa) và daemon bên kia.` }, 502);
+      store.setRequestStatus(request.id, 'declined');
+      return c.json({ error: `${peerName} không nhận yêu cầu: ${(err as Error).message}` }, 502);
     }
-    const body = (await res.json().catch(() => ({}))) as { name?: string; error?: string };
-    if (!res.ok) return c.json({ error: body.error ?? `${invite.name} từ chối (${res.status})` }, 400);
-    if (body.name !== invite.name) return c.json({ error: `máy ở ${invite.url} tự nhận là "${body.name}", không phải "${invite.name}"` }, 400);
-    store.upsertPeer({ name: invite.name, url: invite.url, token: invite.secret, folders });
-    log('paired', { peer: invite.name, url: invite.url, folders });
-    return c.json({ peer: invite.name, folders });
+    log('connect_sent', { to: peerName, folders });
+    return c.json({ request_id: request.id, peer: peerName });
   });
 
-  localApp.get('/local/peers', (c) => c.json({ peers: store.listPeers().map(({ token: _t, ...p }) => p) }));
+  const publicRequest = (r: ConnectRequest) => ({
+    id: r.id,
+    name: r.name,
+    url: r.url,
+    identity: r.identity,
+    folders: r.folders,
+    status: r.status,
+    remote_folders: r.remoteFolders,
+  });
+  localApp.get('/local/requests', (c) =>
+    c.json({ incoming: store.listRequests('in', 'pending').map(publicRequest), outgoing: store.listRequests('out', 'pending').map(publicRequest) }),
+  );
+  localApp.get('/local/requests/:id', (c) => {
+    const r = store.getRequest(c.req.param('id'));
+    return r ? c.json(publicRequest(r)) : c.json({ error: 'not found' }, 404);
+  });
+  localApp.post('/local/requests/answer', async (c) => {
+    const parsed = z
+      .object({ request_id: z.string(), accept: z.boolean(), folders: z.array(z.string()).optional() })
+      .safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: 'invalid' }, 400);
+    const req = store.getRequest(parsed.data.request_id);
+    if (!req || req.direction !== 'in' || req.status !== 'pending') return c.json({ error: 'không còn yêu cầu này' }, 404);
+    let folders: string[] = [];
+    if (parsed.data.accept) {
+      const checked = checkFolders(parsed.data.folders ?? []);
+      if (typeof checked === 'string') return c.json({ error: checked }, 400);
+      if (checked.length === 0) return c.json({ error: 'chọn ít nhất 1 folder' }, 400);
+      folders = checked;
+    }
+    try {
+      const res = await fetchImpl(`${req.url}/connect/answer`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ request_id: req.id, secret: req.secret, accepted: parsed.data.accept, name: opts.name, folders }),
+        signal: AbortSignal.timeout(PEER_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      if (!parsed.data.accept) {
+        store.setRequestStatus(req.id, 'declined');
+        return c.json({ declined: req.name });
+      }
+      return c.json({ error: `không gửi được câu trả lời tới ${req.name} (${(err as Error).message}). Máy họ có đang bật và share Tailscale cho bạn chưa? Thử lại sau.` }, 502);
+    }
+    if (!parsed.data.accept) {
+      store.setRequestStatus(req.id, 'declined');
+      return c.json({ declined: req.name });
+    }
+    store.upsertPeer({ name: req.name, url: req.url, token: req.secret, folders, remoteFolders: req.folders });
+    store.setRequestStatus(req.id, 'accepted');
+    log('connected', { peer: req.name, folders, remote_folders: req.folders });
+    return c.json({ peer: req.name, identity: req.identity, folders, remote_folders: req.folders });
+  });
+
+  localApp.get('/local/peers', (c) =>
+    c.json({ peers: store.listPeers().map((p) => ({ name: p.name, url: p.url, folders: p.folders, remote_folders: p.remoteFolders })) }),
+  );
   localApp.post('/local/peers/folders', async (c) => {
     const parsed = z.object({ name: PeerNameSchema, folders: FoldersSchema }).safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'invalid' }, 400);
@@ -463,8 +546,19 @@ function frameAsk(msg: PeerMessage): string {
   ].join('\n');
 }
 
-function hashSecret(secret: string): string {
-  return createHash('sha256').update(secret).digest('hex');
+function safeEqual(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+function remoteIp(c: Context): string | undefined {
+  try {
+    const addr = getConnInfo(c).remote.address;
+    return addr?.replace(/^::ffff:/, '') || undefined;
+  } catch {
+    return undefined; // not served by @hono/node-server (tests)
+  }
 }
 
 /** Normalizes folder choices; returns an error message when one isn't an existing directory. */
@@ -479,9 +573,6 @@ function checkFolders(input: string[]): string[] | string {
 }
 
 function peerForToken(header: string | undefined, peers: DaemonPeer[]): DaemonPeer | undefined {
-  const presented = Buffer.from(header?.replace(/^Bearer\s+/i, '') ?? '');
-  return peers.find((p) => {
-    const expected = Buffer.from(p.token);
-    return presented.length === expected.length && timingSafeEqual(presented, expected);
-  });
+  const presented = header?.replace(/^Bearer\s+/i, '') ?? '';
+  return peers.find((p) => safeEqual(presented, p.token));
 }

@@ -7,10 +7,27 @@ export interface PeerRecord {
   name: string;
   url: string;
   token: string;
+  /** What this peer may read on this machine. */
   folders: string[];
+  /** What the peer lets us read on their machine (informational; they enforce it). */
+  remoteFolders: string[];
 }
 
-export type InviteTake = { ok: true; folders: string[] } | { ok: false; reason: 'unknown' | 'used' | 'expired' };
+export type RequestStatus = 'pending' | 'accepted' | 'declined';
+
+export interface ConnectRequest {
+  id: string;
+  direction: 'in' | 'out';
+  name: string;
+  url: string;
+  secret: string;
+  /** out: folders we grant them · in: folders they grant us */
+  folders: string[];
+  identity?: string;
+  status: RequestStatus;
+  /** out + accepted: folders they granted us */
+  remoteFolders?: string[];
+}
 
 export interface OutboxEntry {
   message: PeerMessage;
@@ -55,13 +72,20 @@ export class BridgeStore {
         url TEXT NOT NULL,
         token TEXT NOT NULL,
         folders TEXT NOT NULL,
+        remote_folders TEXT NOT NULL DEFAULT '[]',
         created_at INTEGER NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS invites (
-        secret_hash TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS requests (
+        id TEXT PRIMARY KEY,
+        direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        secret TEXT NOT NULL,
         folders TEXT NOT NULL,
-        expires_at INTEGER NOT NULL,
-        used_at INTEGER
+        identity TEXT,
+        status TEXT NOT NULL,
+        remote_folders TEXT,
+        created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY,
@@ -163,10 +187,10 @@ export class BridgeStore {
   upsertPeer(p: PeerRecord): void {
     this.db
       .prepare(
-        `INSERT INTO peers (name, url, token, folders, created_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (name) DO UPDATE SET url = excluded.url, token = excluded.token, folders = excluded.folders`,
+        `INSERT INTO peers (name, url, token, folders, remote_folders, created_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (name) DO UPDATE SET url = excluded.url, token = excluded.token, folders = excluded.folders, remote_folders = excluded.remote_folders`,
       )
-      .run(p.name, p.url, p.token, JSON.stringify(p.folders), Date.now());
+      .run(p.name, p.url, p.token, JSON.stringify(p.folders), JSON.stringify(p.remoteFolders), Date.now());
   }
 
   getPeer(name: string): PeerRecord | undefined {
@@ -186,19 +210,48 @@ export class BridgeStore {
     return Number(this.db.prepare('DELETE FROM peers WHERE name = ?').run(name).changes) > 0;
   }
 
-  createInvite(secretHash: string, folders: string[], expiresAt: number): void {
-    this.db.prepare('INSERT INTO invites (secret_hash, folders, expires_at) VALUES (?, ?, ?)').run(secretHash, JSON.stringify(folders), expiresAt);
+  saveRequest(r: ConnectRequest): void {
+    if (r.direction === 'in') {
+      this.db.prepare("DELETE FROM requests WHERE direction = 'in' AND name = ? AND status = 'pending' AND id != ?").run(r.name, r.id);
+    }
+    this.db
+      .prepare(
+        `INSERT INTO requests (id, direction, name, url, secret, folders, identity, status, remote_folders, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (id) DO UPDATE SET status = excluded.status, remote_folders = excluded.remote_folders`,
+      )
+      .run(
+        r.id,
+        r.direction,
+        r.name,
+        r.url,
+        r.secret,
+        JSON.stringify(r.folders),
+        r.identity ?? null,
+        r.status,
+        r.remoteFolders ? JSON.stringify(r.remoteFolders) : null,
+        Date.now(),
+      );
   }
 
-  /** Atomically consumes an invite; a second take of the same invite fails with 'used'. */
-  takeInvite(secretHash: string, now: number): InviteTake {
-    const row = this.db.prepare('SELECT * FROM invites WHERE secret_hash = ?').get(secretHash) as Row | undefined;
-    if (!row) return { ok: false, reason: 'unknown' };
-    if (row.used_at !== null) return { ok: false, reason: 'used' };
-    if (Number(row.expires_at) < now) return { ok: false, reason: 'expired' };
-    const res = this.db.prepare('UPDATE invites SET used_at = ? WHERE secret_hash = ? AND used_at IS NULL').run(now, secretHash);
-    if (Number(res.changes) === 0) return { ok: false, reason: 'used' };
-    return { ok: true, folders: JSON.parse(String(row.folders)) as string[] };
+  getRequest(id: string): ConnectRequest | undefined {
+    const row = this.db.prepare('SELECT * FROM requests WHERE id = ?').get(id) as Row | undefined;
+    return row ? toRequest(row) : undefined;
+  }
+
+  listRequests(direction: 'in' | 'out', status?: RequestStatus): ConnectRequest[] {
+    const rows = (
+      status
+        ? this.db.prepare('SELECT * FROM requests WHERE direction = ? AND status = ? ORDER BY created_at, rowid').all(direction, status)
+        : this.db.prepare('SELECT * FROM requests WHERE direction = ? ORDER BY created_at, rowid').all(direction)
+    ) as Row[];
+    return rows.map(toRequest);
+  }
+
+  setRequestStatus(id: string, status: RequestStatus, remoteFolders?: string[]): void {
+    this.db
+      .prepare('UPDATE requests SET status = ?, remote_folders = COALESCE(?, remote_folders) WHERE id = ?')
+      .run(status, remoteFolders ? JSON.stringify(remoteFolders) : null, id);
   }
 
   close(): void {
@@ -207,7 +260,28 @@ export class BridgeStore {
 }
 
 function toPeer(r: Row): PeerRecord {
-  return { name: String(r.name), url: String(r.url), token: String(r.token), folders: JSON.parse(String(r.folders)) as string[] };
+  return {
+    name: String(r.name),
+    url: String(r.url),
+    token: String(r.token),
+    folders: JSON.parse(String(r.folders)) as string[],
+    remoteFolders: JSON.parse(String(r.remote_folders ?? '[]')) as string[],
+  };
+}
+
+function toRequest(r: Row): ConnectRequest {
+  const req: ConnectRequest = {
+    id: String(r.id),
+    direction: r.direction as ConnectRequest['direction'],
+    name: String(r.name),
+    url: String(r.url),
+    secret: String(r.secret),
+    folders: JSON.parse(String(r.folders)) as string[],
+    status: r.status as RequestStatus,
+  };
+  if (r.identity) req.identity = String(r.identity);
+  if (r.remote_folders) req.remoteFolders = JSON.parse(String(r.remote_folders)) as string[];
+  return req;
 }
 
 function toMessage(r: Row): PeerMessage {
