@@ -17,7 +17,7 @@ User-facing: [README.md](README.md) (human, CLI-only flow). [SETUP.md](SETUP.md)
 ## Rules
 
 - Source is erasable-only TypeScript with `.ts` import specifiers (`erasableSyntaxOnly`, `verbatimModuleSyntax`); `npm run build` emits `dist/` with specifiers rewritten to `.js`. Node refuses to strip types under `node_modules`, so installs must run `dist/`.
-- `dist/` is committed so `npm i -g github:trananhhh/agent-bridge` needs no build (npm's allow-scripts can block `prepare`). Run `npm run build` before every commit that touches `src/`.
+- `dist/` is committed so `npm i -g https://github.com/trananhhh/agent-bridge/tarball/main` needs no build (npm's allow-scripts can block `prepare`). Run `npm run build` before every commit that touches `src/`.
 - `channel.ts` stdout is the MCP JSON-RPC stream: never `console.log` there; log to stderr.
 - Peer `folders` is the data boundary: every place that picks a session or cwd for a peer's question must filter with `isWithin(cwd, peer.folders)`, and headless runs pass them as `readOnlyDirs` (→ `--restricted --add-dir`).
 - Headless runs: `--restricted --strict-mcp-config --tools Read,Grep,Glob,WebSearch --permission-mode dontAsk`. Verified: Read outside folders is denied by the CLI, Write/Bash don't exist. Don't loosen this — it is the product's write-needs-owner guarantee.

@@ -16,11 +16,13 @@ Phải share cả hai chiều, vì Tailscale chỉ cho máy được share *nh�
 **3. Cài agent-bridge.** Cần Node ≥ 22.13 và Claude Code.
 
 ```bash
-npm install -g github:trananhhh/agent-bridge
+npm install -g https://github.com/trananhhh/agent-bridge/tarball/main
 agent-bridge
 ```
 
 Lần đầu chạy, CLI hỏi tên của bạn rồi tự cài daemon chạy nền (tự bật khi đăng nhập) và đăng ký MCP cho Claude Code. Nếu macOS hỏi *"Allow node to accept incoming connections"* → bấm **Allow**.
+
+Cập nhật bản mới: chạy lại lệnh `npm install -g …` ở trên, rồi `agent-bridge setup` để khởi động lại daemon.
 
 ## Kết nối
 

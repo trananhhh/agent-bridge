@@ -13,7 +13,7 @@ const CLI_PATH = fileURLToPath(import.meta.url);
 const SERVICE_LABEL = 'com.agent-bridge.daemon';
 const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
 const LOG_PATH = join(BRIDGE_HOME, 'daemon.log');
-const INSTALL_CMD = 'npm install -g github:trananhhh/agent-bridge';
+const INSTALL_CMD = 'npm install -g https://github.com/trananhhh/agent-bridge/tarball/main';
 const WAIT_FOR_ANSWER_MS = 15 * 60_000;
 const TAILSCALE_GUIDE = `Kết nối Tailscale với đồng nghiệp (mỗi người một account, làm 1 lần):
   1. Mở https://login.tailscale.com/admin/machines
