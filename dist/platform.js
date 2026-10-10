@@ -68,6 +68,9 @@ export function notify(title, body) {
         execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', WIN_NOTIFY_PS], { env: { ...process.env, AB_TITLE: title, AB_BODY: body || ' ' }, windowsHide: true }, () => { });
     }
 }
+function sleepMs(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 const pidFile = (bridgeHome) => join(bridgeHome, 'daemon.pid');
 export function writePidFile(bridgeHome) {
     writeFileSync(pidFile(bridgeHome), String(process.pid));
@@ -137,7 +140,22 @@ export function installService(spec) {
         writeFileSync(LAUNCHD_PLIST, launchdPlist(spec));
         const domain = `gui/${process.getuid?.()}`;
         tryExec('launchctl', ['bootout', `${domain}/${LAUNCHD_LABEL}`]);
-        execFileSync('launchctl', ['bootstrap', domain, LAUNCHD_PLIST]);
+        // bootout is asynchronous: bootstrapping while the old job is still tearing down fails with "5: Input/output error".
+        for (let attempt = 0;; attempt++) {
+            if (tryExec('launchctl', ['print', `${domain}/${LAUNCHD_LABEL}`]) === undefined) {
+                try {
+                    execFileSync('launchctl', ['bootstrap', domain, LAUNCHD_PLIST], { stdio: 'ignore' });
+                    break;
+                }
+                catch (err) {
+                    if (attempt >= 20)
+                        throw err;
+                }
+            }
+            if (attempt >= 20)
+                throw new Error('launchd did not release the previous agent-bridge job; try again in a few seconds');
+            sleepMs(500);
+        }
         return 'launchd agent (restarts on crash, starts at login)';
     }
     if (IS_WIN) {

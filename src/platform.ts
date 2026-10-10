@@ -101,6 +101,10 @@ export interface ServiceSpec {
   claudeDir?: string;
 }
 
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 const pidFile = (bridgeHome: string) => join(bridgeHome, 'daemon.pid');
 
 export function writePidFile(bridgeHome: string): void {
@@ -172,7 +176,19 @@ export function installService(spec: ServiceSpec): string | undefined {
     writeFileSync(LAUNCHD_PLIST, launchdPlist(spec));
     const domain = `gui/${process.getuid?.()}`;
     tryExec('launchctl', ['bootout', `${domain}/${LAUNCHD_LABEL}`]);
-    execFileSync('launchctl', ['bootstrap', domain, LAUNCHD_PLIST]);
+    // bootout is asynchronous: bootstrapping while the old job is still tearing down fails with "5: Input/output error".
+    for (let attempt = 0; ; attempt++) {
+      if (tryExec('launchctl', ['print', `${domain}/${LAUNCHD_LABEL}`]) === undefined) {
+        try {
+          execFileSync('launchctl', ['bootstrap', domain, LAUNCHD_PLIST], { stdio: 'ignore' });
+          break;
+        } catch (err) {
+          if (attempt >= 20) throw err;
+        }
+      }
+      if (attempt >= 20) throw new Error('launchd did not release the previous agent-bridge job; try again in a few seconds');
+      sleepMs(500);
+    }
     return 'launchd agent (restarts on crash, starts at login)';
   }
   if (IS_WIN) {
