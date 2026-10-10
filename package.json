@@ -1,6 +1,6 @@
 {
   "name": "@trananhhh/agent-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Let Claude Code agents on different machines talk to each other over Tailscale",
   "type": "module",
@@ -8,8 +8,8 @@
     "node": ">=22.13"
   },
   "bin": {
-    "agent-bridge": "bin/agent-bridge",
-    "claude-bridge": "bin/claude-bridge"
+    "agent-bridge": "bin/agent-bridge.js",
+    "claude-bridge": "bin/claude-bridge.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { claudeInvocation } from "./platform.js";
 const STDOUT_CAP = 5 * 1024 * 1024;
 export const READ_ONLY_TOOLS = 'Read,Grep,Glob,WebSearch';
 const WRITE_TOOLS = 'Edit,Write,NotebookEdit';
@@ -44,7 +45,8 @@ export function createClaudeRunner(bin = 'claude') {
         const env = { ...process.env };
         for (const k of STRIPPED_ENV)
             delete env[k];
-        const child = spawn(bin, buildClaudeArgs(opts), { cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+        const inv = claudeInvocation(bin);
+        const child = spawn(inv.command, [...inv.args, ...buildClaudeArgs(opts)], { cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
         let stdout = '';
         let stderr = '';
         const timer = opts.timeoutMs

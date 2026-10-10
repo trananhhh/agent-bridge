@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { homedir, userInfo } from 'node:os';
+import { existsSync, statSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -8,11 +8,10 @@ import { parseArgs } from 'node:util';
 import { buildAgentNote } from './agent-note.ts';
 import { BRIDGE_HOME, CONFIG_PATH, VERSION, expandPath, loadConfig, readRawConfig, writeRawConfig, type RawConfig } from './config.ts';
 import { findBridges, parseTailscaleStatus, type FoundBridge } from './discovery.ts';
+import { IS_WIN, claudeInvocation, copyToClipboard, findClaude, installService, openUrl, serviceInstalled, uninstallService } from './platform.ts';
 import { tailscaleStatus, tailscaleWhois } from './tailscale.ts';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
-const SERVICE_LABEL = 'com.agent-bridge.daemon';
-const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
 const LOG_PATH = join(BRIDGE_HOME, 'daemon.log');
 const INSTALL_CMD = 'npm install -g https://github.com/trananhhh/agent-bridge/tarball/main';
 const WAIT_FOR_ANSWER_MS = 15 * 60_000;
@@ -88,7 +87,7 @@ async function askFolders(question: string): Promise<string[]> {
 }
 
 function sh(bin: string, args: string[], input?: string): string {
-  return execFileSync(bin, args, { encoding: 'utf8', timeout: 15_000, input, stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'] }).trim();
+  return execFileSync(bin, args, { encoding: 'utf8', timeout: 15_000, input, windowsHide: true, stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'] }).trim();
 }
 
 function tryRun(bin: string, args: string[], input?: string): string | undefined {
@@ -102,7 +101,7 @@ function tryRun(bin: string, args: string[], input?: string): string | undefined
 function printNote(note: string): void {
   const line = '─'.repeat(60);
   console.log(`\n${line}\nPaste this into your Claude Code:\n${line}\n${note}\n${line}`);
-  if (process.platform === 'darwin' && tryRun('pbcopy', [], note) !== undefined) console.log('(copied to clipboard)');
+  if (copyToClipboard(note)) console.log('(copied to clipboard)');
 }
 
 // ── daemon API ─────────────────────────────────────────────────────────────
@@ -145,53 +144,10 @@ const hostOf = (url: string) => new URL(url).hostname;
 
 // ── setup ──────────────────────────────────────────────────────────────────
 
-function detectClaudeBin(): string | undefined {
-  // Keep the launcher path (not its realpath): Claude Code's auto-updater swaps the versioned target behind it.
-  return tryRun('/bin/sh', ['-c', 'command -v claude']) ?? tryRun('/bin/zsh', ['-lc', 'command -v claude']);
-}
-
-function serviceInstalled(): boolean {
-  return process.platform === 'darwin' && existsSync(PLIST_PATH);
-}
-
-function installService(): void {
-  const cfg = loadConfig();
-  const claudeDir = cfg.claudeBin.includes('/') ? dirname(cfg.claudeBin) : '';
-  const path = [dirname(process.execPath), claudeDir, '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].filter(Boolean).join(':');
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  const args = [process.execPath, '--disable-warning=ExperimentalWarning', CLI_PATH, 'daemon'];
-  const env: Record<string, string> = { PATH: path, HOME: homedir(), ...(process.env.BRIDGE_HOME ? { BRIDGE_HOME } : {}) };
-  mkdirSync(dirname(PLIST_PATH), { recursive: true });
-  mkdirSync(BRIDGE_HOME, { recursive: true });
-  writeFileSync(
-    PLIST_PATH,
-    `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${SERVICE_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>${args.map((a) => `<string>${esc(a)}</string>`).join('')}</array>
-  <key>EnvironmentVariables</key>
-  <dict>${Object.entries(env).map(([k, v]) => `<key>${k}</key><string>${esc(v)}</string>`).join('')}</dict>
-  <key>WorkingDirectory</key><string>${esc(BRIDGE_HOME)}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>${esc(LOG_PATH)}</string>
-  <key>StandardErrorPath</key><string>${esc(LOG_PATH)}</string>
-</dict>
-</plist>
-`,
-  );
-  const domain = `gui/${process.getuid?.()}`;
-  tryRun('launchctl', ['bootout', `${domain}/${SERVICE_LABEL}`]);
-  sh('launchctl', ['bootstrap', domain, PLIST_PATH]);
-}
-
 function registerMcp(claudeBin: string): void {
-  tryRun(claudeBin, ['mcp', 'remove', '-s', 'user', 'agent-bridge']);
-  sh(claudeBin, ['mcp', 'add', '-s', 'user', 'agent-bridge', '--', process.execPath, '--disable-warning=ExperimentalWarning', CLI_PATH, 'channel']);
+  const inv = claudeInvocation(claudeBin);
+  tryRun(inv.command, [...inv.args, 'mcp', 'remove', '-s', 'user', 'agent-bridge']);
+  sh(inv.command, [...inv.args, 'mcp', 'add', '-s', 'user', 'agent-bridge', '--', process.execPath, '--disable-warning=ExperimentalWarning', CLI_PATH, 'channel']);
 }
 
 async function waitForDaemon(port: number): Promise<boolean> {
@@ -208,13 +164,13 @@ async function waitForDaemon(port: number): Promise<boolean> {
 
 async function cmdSetup(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, options: { name: { type: 'string' } } });
-  if (CLI_PATH.includes('/_npx/')) {
+  if (/[\\/]_npx[\\/]/.test(CLI_PATH)) {
     throw new Error(`agent-bridge runs a background daemon, so install it globally instead of using npx:\n  ${INSTALL_CMD}\n  agent-bridge`);
   }
   const ts = await tailscaleStatus();
   const selfIp = ts ? parseTailscaleStatus(ts).selfIp : undefined;
   if (!selfIp) throw new Error('Tailscale is not installed or not logged in. Install https://tailscale.com/download, log in, then run this again.');
-  const claudeBin = detectClaudeBin();
+  const claudeBin = findClaude();
   if (!claudeBin) throw new Error('`claude` not found. Install Claude Code first: https://claude.com/claude-code');
 
   const existing = existsSync(CONFIG_PATH) ? readRawConfig() : undefined;
@@ -225,16 +181,24 @@ async function cmdSetup(argv: string[]): Promise<void> {
   const raw: RawConfig = { ...existing, name, listenHost: selfIp, claudeBin };
   writeRawConfig(raw);
   console.log(`✓ name: ${name} · Tailscale ${selfIp}`);
-  if (process.platform === 'darwin') {
-    installService();
-    console.log(`✓ daemon running in the background, starts at login (log: ${LOG_PATH})`);
-  } else {
-    console.log('! Linux: keep `agent-bridge daemon` running under systemd/tmux yourself');
-  }
+  const service = installService({
+    nodePath: process.execPath,
+    cliPath: CLI_PATH,
+    bridgeHome: BRIDGE_HOME,
+    logPath: LOG_PATH,
+    bridgeHomeEnv: process.env.BRIDGE_HOME,
+    claudeDir: claudeBin.includes('/') ? dirname(claudeBin) : undefined,
+  });
+  if (service) console.log(`✓ daemon running in the background — ${service} (log: ${LOG_PATH})`);
+  else console.log('! Linux: keep `agent-bridge daemon` running under systemd/tmux yourself');
   registerMcp(claudeBin);
   console.log('✓ MCP server "agent-bridge" registered for Claude Code');
   if (!(await waitForDaemon(raw.localPort ?? 8791))) console.log(`! daemon not responding yet — check ${LOG_PATH}`);
-  console.log('  If macOS asks to "Allow node to accept incoming connections" → click Allow.');
+  console.log(
+    IS_WIN
+      ? '  If Windows Firewall asks about Node.js → click Allow (tick Private and Public).'
+      : '  If macOS asks to "Allow node to accept incoming connections" → click Allow.',
+  );
 }
 
 // ── connect / requests ─────────────────────────────────────────────────────
@@ -253,7 +217,7 @@ async function cmdConnect(argv: string[]): Promise<void> {
     console.log(`\nNobody found. Machines online in your Tailscale: ${online.map((p) => p.host).join(', ') || '(none)'}`);
     console.log(`- Colleague's machine not listed → Tailscale isn't shared yet:\n\n${TAILSCALE_GUIDE}\n`);
     console.log('- Their machine is listed but not found → they haven\'t run `agent-bridge` yet, or a firewall blocks node.');
-    if (process.platform === 'darwin' && (await confirm('Open the Tailscale admin page to share your machine?'))) tryRun('open', ['https://login.tailscale.com/admin/machines']);
+    if (await confirm('Open the Tailscale admin page to share your machine?', false)) openUrl('https://login.tailscale.com/admin/machines');
     return;
   }
 
@@ -352,7 +316,7 @@ async function cmdRemove(argv: string[]): Promise<void> {
 async function cmdStatus(): Promise<void> {
   const cfg = loadConfig();
   console.log(`agent-bridge ${VERSION} · ${cfg.name} · http://${cfg.listenHost}:${cfg.peerPort}`);
-  console.log(`service: ${serviceInstalled() ? `launchd (log ${LOG_PATH})` : 'not installed'}`);
+  console.log(`service: ${serviceInstalled() ? `installed (log ${LOG_PATH})` : 'not installed'}`);
   let peers: PeerView[] = [];
   try {
     const s = await api<{ live: number; outbox: number }>('/local/status');
@@ -374,10 +338,9 @@ async function cmdStatus(): Promise<void> {
 }
 
 function cmdUninstall(): void {
-  tryRun('launchctl', ['bootout', `gui/${process.getuid?.()}/${SERVICE_LABEL}`]);
-  rmSync(PLIST_PATH, { force: true });
-  const claudeBin = existsSync(CONFIG_PATH) ? loadConfig().claudeBin : 'claude';
-  tryRun(claudeBin, ['mcp', 'remove', '-s', 'user', 'agent-bridge']);
+  uninstallService(BRIDGE_HOME);
+  const inv = claudeInvocation(existsSync(CONFIG_PATH) ? loadConfig().claudeBin : 'claude');
+  tryRun(inv.command, [...inv.args, 'mcp', 'remove', '-s', 'user', 'agent-bridge']);
   console.log(`✓ daemon stopped and MCP server removed. Data kept in ${BRIDGE_HOME} (delete it to forget all connections).`);
 }
 
@@ -418,8 +381,10 @@ async function main(): Promise<void> {
       return cmdStatus();
     case 'uninstall':
       return cmdUninstall();
-    case 'daemon':
-      return (await import('./daemon-main.ts')).runDaemon();
+    case 'daemon': {
+      const { values } = parseArgs({ args: rest, options: { log: { type: 'string' } } });
+      return (await import('./daemon-main.ts')).runDaemon({ logFile: values.log });
+    }
     case 'channel':
       return (await import('./channel.ts')).runChannel();
     case 'version':

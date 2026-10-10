@@ -2,13 +2,13 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
-const CANDIDATES = ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale'];
+const CANDIDATES = ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale', 'C:\\Program Files\\Tailscale\\tailscale.exe'];
 
 /** Runs the Tailscale CLI (PATH or the macOS app bundle); undefined when unavailable. */
 export async function tailscale(args: string[]): Promise<string | undefined> {
   for (const bin of CANDIDATES) {
     try {
-      const { stdout } = await run(bin, args, { timeout: 10_000, maxBuffer: 10 * 1024 * 1024 });
+      const { stdout } = await run(bin, args, { timeout: 10_000, maxBuffer: 10 * 1024 * 1024, windowsHide: true });
       return stdout;
     } catch {
       // try next location

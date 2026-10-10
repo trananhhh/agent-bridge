@@ -1,23 +1,33 @@
 import { serve } from '@hono/node-server';
-import { execFile } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
+import { format } from 'node:util';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createClaudeRunner } from './claude-runner.ts';
-import { DB_PATH, VERSION, loadConfig } from './config.ts';
+import { BRIDGE_HOME, DB_PATH, VERSION, loadConfig } from './config.ts';
 import { createDaemon } from './daemon.ts';
 import { listRecentSessions } from './sessions.ts';
 import { BridgeStore } from './store.ts';
+import { notify, removePidFile, writePidFile } from './platform.ts';
 import { tailscaleWhois } from './tailscale.ts';
 
 const OUTBOX_INTERVAL_MS = 30_000;
 const PROJECTS_ROOT = join(homedir(), '.claude', 'projects');
 
-function notify(title: string, body: string): void {
-  if (process.platform !== 'darwin') return;
-  execFile('osascript', ['-e', `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`], () => {});
+/** Background launchers without stdio redirection (Windows Startup) pass --log. */
+function logTo(file: string): void {
+  const out = createWriteStream(file, { flags: 'a' });
+  const write = (...args: unknown[]) => out.write(`${format(...args)}\n`);
+  console.log = write;
+  console.error = write;
+  process.on('uncaughtException', (err) => {
+    write(JSON.stringify({ event: 'crashed', error: String(err?.stack ?? err) }));
+    process.exit(1);
+  });
 }
 
-export async function runDaemon(): Promise<void> {
+export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> {
+  if (opts.logFile) logTo(opts.logFile);
   const cfg = loadConfig();
   const store = new BridgeStore(DB_PATH);
   const publicUrl = `http://${cfg.listenHost}:${cfg.peerPort}`;
@@ -39,6 +49,8 @@ export async function runDaemon(): Promise<void> {
 
   const peerServer = serve({ fetch: daemon.peerApp.fetch, hostname: cfg.listenHost, port: cfg.peerPort });
   const localServer = serve({ fetch: daemon.localApp.fetch, hostname: '127.0.0.1', port: cfg.localPort });
+  writePidFile(BRIDGE_HOME);
+  process.on('exit', () => removePidFile(BRIDGE_HOME));
   const outboxTimer = setInterval(() => {
     daemon.flushOutbox().catch((err) => console.error(JSON.stringify({ event: 'outbox_flush_failed', error: String(err) })));
   }, OUTBOX_INTERVAL_MS);

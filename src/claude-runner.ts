@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { claudeInvocation } from './platform.ts';
 
 export interface ClaudeRunOptions {
   prompt: string;
@@ -62,7 +63,8 @@ export function createClaudeRunner(bin = 'claude'): ClaudeRunner {
     new Promise((resolve, reject) => {
       const env = { ...process.env };
       for (const k of STRIPPED_ENV) delete env[k];
-      const child = spawn(bin, buildClaudeArgs(opts), { cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      const inv = claudeInvocation(bin);
+      const child = spawn(inv.command, [...inv.args, ...buildClaudeArgs(opts)], { cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       let stdout = '';
       let stderr = '';
       const timer = opts.timeoutMs

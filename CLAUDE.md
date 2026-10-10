@@ -4,7 +4,9 @@ User-facing: [README.md](README.md) (human, CLI-only flow). [SETUP.md](SETUP.md)
 
 ## Layout
 
-- `src/cli.ts` — single entry (`bin/agent-bridge` → `dist/cli.js`): interactive wizard (`setup`, `connect`, `requests`, …) as thin clients of the daemon's local API, plus `daemon` / `channel`. Prompts read from one shared line queue so piped answers work.
+- `bin/*.js` — tiny Node wrappers (npm turns them into proper `.cmd` shims on Windows).
+- `src/platform.ts` — every OS difference: finding `claude` (unwraps npm's `claude.cmd` to `node cli.js`, so no shell), background service (macOS launchd / Windows Startup-folder VBS + pid file), notifications, clipboard, opening URLs.
+- `src/cli.ts` — single entry (`bin/agent-bridge.js` → `dist/cli.js`): interactive wizard (`setup`, `connect`, `requests`, …) as thin clients of the daemon's local API, plus `daemon` / `channel`. Prompts read from one shared line queue so piped answers work.
 - Connecting: requester's daemon `POST /connect` {request_id, name, url, secret, folders} → target stores a pending request (identity from `tailscale whois` of the remote IP, URL rebuilt from that IP) and notifies → target owner accepts → target `POST /connect/answer` back with the secret → both store the peer; the secret is the pair's bearer token.
 - `src/discovery.ts` — `tailscale status --json` → probe `GET /health` (`app: "agent-bridge"`) on every online peer. `src/tailscale.ts` wraps the CLI (PATH or the macOS app bundle).
 - `src/agent-note.ts` — the "save to memory" text printed after connecting.

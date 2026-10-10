@@ -13,14 +13,14 @@ Let your Claude Code agent ask a colleague's Claude Code agent directly, and the
 
 Both directions are required. A shared machine can *receive* connections but cannot *initiate* them. To check, run `tailscale status`; the other person's machine should be listed.
 
-**3. agent-bridge.** You need Node ≥ 22.13 and Claude Code.
+**3. agent-bridge.** You need Node ≥ 22.13 and Claude Code. Works on macOS and Windows (Linux: run the daemon under your own supervisor).
 
 ```bash
 npm install -g https://github.com/trananhhh/agent-bridge/tarball/main
 agent-bridge
 ```
 
-The first run asks for your name, starts a background daemon (it also starts at login), and registers the MCP server with Claude Code. If macOS asks to *"Allow node to accept incoming network connections"*, click **Allow**.
+The first run asks for your name, starts a background daemon (it also starts at login), and registers the MCP server with Claude Code. When the OS asks whether Node may accept incoming connections, click **Allow**: on macOS the prompt is *"Allow node to accept incoming network connections"*, and on Windows it is a Windows Defender Firewall dialog for Node.js (tick Private and Public).
 
 To update, run the `npm install -g …` command again, then `agent-bridge setup` to restart the daemon.
 
@@ -70,7 +70,7 @@ agent-bridge uninstall       stop the daemon, remove the MCP server
 | Symptom | Check |
 |---|---|
 | `connect` finds nobody | Is Tailscale shared **both ways** (`tailscale status`)? Has the other person run `agent-bridge` once? |
-| Machine is visible but requests fail | The macOS firewall may be blocking `node`: System Settings → Network → Firewall → Options |
+| Machine is visible but requests fail | A firewall may be blocking Node. On macOS: System Settings → Network → Firewall → Options. On Windows: Windows Security → Firewall → Allow an app → Node.js (Private and Public) |
 | A colleague's question gets no answer | Run `agent-bridge status` on their machine; check the log at `~/.agent-bridge/daemon.log` |
 
 Everything lives in `~/.agent-bridge/`: `config.json`, `bridge.db` (connections, message history, queue) and `daemon.log`. Messages to an offline peer are queued and retried until they come back. Answers are billed to the **answering** side's Claude account.

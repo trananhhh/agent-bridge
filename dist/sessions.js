@@ -5,7 +5,10 @@ const FIELD_MAX = 300;
 export function isWithin(path, dirs) {
     if (!path)
         return false;
-    return dirs.some((d) => path === d || path.startsWith(d.endsWith(sep) ? d : d + sep));
+    // Windows paths are case-insensitive and drive letters come back in either case.
+    const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+    const target = norm(path);
+    return dirs.map(norm).some((d) => target === d || target.startsWith(d.endsWith(sep) ? d : d + sep));
 }
 /** Scans every Claude Code project transcript (~/.claude/projects/*\/*.jsonl), newest first, keeping sessions whose cwd is inside allowedDirs. */
 export function listRecentSessions(projectsRoot, opts) {
