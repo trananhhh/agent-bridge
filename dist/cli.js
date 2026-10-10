@@ -12,7 +12,7 @@ import { IS_WIN, claudeInvocation, copyToClipboard, findClaude, installService, 
 import { tailscaleStatus, tailscaleWhois } from "./tailscale.js";
 const CLI_PATH = fileURLToPath(import.meta.url);
 const LOG_PATH = join(BRIDGE_HOME, 'daemon.log');
-const INSTALL_CMD = 'npm install -g https://github.com/trananhhh/agent-bridge/tarball/main';
+const INSTALL_CMD = 'npm install -g --prefer-online https://github.com/trananhhh/agent-bridge/tarball/main';
 const WAIT_FOR_ANSWER_MS = 15 * 60_000;
 const TAILSCALE_GUIDE = `Link Tailscale with a colleague (separate accounts, once per pair):
   1. Open https://login.tailscale.com/admin/machines

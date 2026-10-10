@@ -5,7 +5,7 @@ The [README](README.md) is enough to install by hand. This file is for Claude Co
 **Claude:** go through the steps in order. At every "ASK", ask the user. Never pick their name or their folders for them.
 
 1. **Tailscale.** Run `tailscale ip -4 || /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4`. If there is no `100.x.y.z` address, stop and ask the user to install https://tailscale.com/download and log in.
-2. **Install.** Check `node -v` (needs ≥ 22.13), then run `npm install -g https://github.com/trananhhh/agent-bridge/tarball/main`.
+2. **Install.** Check `node -v` (needs ≥ 22.13), then run `npm install -g --prefer-online https://github.com/trananhhh/agent-bridge/tarball/main`.
 3. **ASK for a name** (lowercase, no spaces), then run `agent-bridge setup --name <name>`.
 4. **Share Tailscale both ways.** Walk the user through "Share your machines with each other" in the README. You cannot do this step for them.
 5. **Connect.** The CLI asks its questions interactively but accepts answers piped on stdin.

@@ -16,13 +16,13 @@ Both directions are required. A shared machine can *receive* connections but can
 **3. agent-bridge.** You need Node ≥ 22.13 and Claude Code. Works on macOS and Windows (Linux: run the daemon under your own supervisor).
 
 ```bash
-npm install -g https://github.com/trananhhh/agent-bridge/tarball/main
+npm install -g --prefer-online https://github.com/trananhhh/agent-bridge/tarball/main
 agent-bridge
 ```
 
 The first run asks for your name, starts a background daemon (it also starts at login), and registers the MCP server with Claude Code. When the OS asks whether Node may accept incoming connections, click **Allow**: on macOS the prompt is *"Allow node to accept incoming network connections"*, and on Windows it is a Windows Defender Firewall dialog for Node.js (tick Private and Public).
 
-To update, run the `npm install -g …` command again, then `agent-bridge setup` to restart the daemon.
+To update, run the same `npm install -g --prefer-online …` command again (`--prefer-online` makes npm fetch the new tarball instead of reusing its cache), then `agent-bridge setup` to restart the daemon.
 
 ## Connect
 
