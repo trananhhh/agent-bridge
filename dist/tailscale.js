@@ -28,7 +28,7 @@ export async function tailscaleWhois(ip) {
         const j = JSON.parse(out);
         const user = j.UserProfile?.LoginName;
         const machine = j.Node?.ComputedName ?? j.Node?.Name?.split('.')[0];
-        return [user, machine && `máy ${machine}`].filter(Boolean).join(', ') || undefined;
+        return [user, machine && `machine ${machine}`].filter(Boolean).join(', ') || undefined;
     }
     catch {
         return undefined;

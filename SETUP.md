@@ -1,18 +1,18 @@
-# SETUP — nếu muốn Claude Code cài hộ
+# SETUP — letting Claude Code install it for you
 
-Người dùng tự cài theo [README](README.md) là đủ. File này dành cho Claude Code khi người dùng nói *"cài agent-bridge cho tôi theo https://github.com/trananhhh/agent-bridge/blob/main/SETUP.md"*.
+The [README](README.md) is enough to install by hand. This file is for Claude Code when the user says *"install agent-bridge for me using https://github.com/trananhhh/agent-bridge/blob/main/SETUP.md"*.
 
-**Claude:** làm lần lượt các bước. Gặp "HỎI" thì phải hỏi người dùng; không tự chọn tên hay folder thay họ.
+**Claude:** go through the steps in order. At every "ASK", ask the user. Never pick their name or their folders for them.
 
-1. **Tailscale:** chạy `tailscale ip -4 || /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4`. Nếu không ra IP `100.x.y.z` → dừng lại, nhờ người dùng cài https://tailscale.com/download và đăng nhập.
-2. **Cài:** `node -v` (cần ≥ 22.13), sau đó chạy `npm install -g https://github.com/trananhhh/agent-bridge/tarball/main`.
-3. **HỎI tên** (chữ thường, không dấu), rồi chạy `agent-bridge setup --name <tên>`.
-4. **Share Tailscale hai chiều:** hướng dẫn người dùng theo mục "Share máy cho nhau" trong README. Bạn không làm hộ được bước này.
-5. **Kết nối:** CLI có câu hỏi tương tác nhưng nhận được input qua pipe.
-   - Mời người khác: `agent-bridge connect` để xem danh sách. HỎI người dùng chọn ai và folder người đó được đọc (nhắc rằng `.env` cũng đọc được), rồi chạy:
-     `printf '<số>\n<folder1>,<folder2>\ny\n' | agent-bridge connect`
-     Lệnh sẽ chờ bên kia chấp nhận, tối đa 15 phút.
-   - Có người đang mời: `agent-bridge requests` để xem. HỎI người dùng có chấp nhận không và chọn folder, rồi chạy:
+1. **Tailscale.** Run `tailscale ip -4 || /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4`. If there is no `100.x.y.z` address, stop and ask the user to install https://tailscale.com/download and log in.
+2. **Install.** Check `node -v` (needs ≥ 22.13), then run `npm install -g https://github.com/trananhhh/agent-bridge/tarball/main`.
+3. **ASK for a name** (lowercase, no spaces), then run `agent-bridge setup --name <name>`.
+4. **Share Tailscale both ways.** Walk the user through "Share your machines with each other" in the README. You cannot do this step for them.
+5. **Connect.** The CLI asks its questions interactively but accepts answers piped on stdin.
+   - **To invite someone:** run `agent-bridge connect` to see the list. ASK the user who to connect and which folders that person may read (mention that `.env` files in those folders are readable too). Then run:
+     `printf '<number>\n<folder1>,<folder2>\ny\n' | agent-bridge connect`
+     The command waits up to 15 minutes for the other side to accept.
+   - **When someone has invited the user:** run `agent-bridge requests` to see it. ASK whether to accept and which folders to share. Then run:
      `printf 'y\n<folder1>,<folder2>\n' | agent-bridge requests`
-6. **Lưu memory:** lấy đoạn hướng dẫn CLI in ra (hoặc chạy `agent-bridge note <tên>`) và lưu vào memory của bạn đúng như nội dung đó.
-7. **Báo cho người dùng:** đã kết nối với ai, mỗi bên đọc được folder nào (`agent-bridge peers`). Muốn tin của đồng nghiệp tự hiện trong conversation thì mở Claude bằng `claude-bridge`.
+6. **Remember.** Save the note the CLI prints (or the output of `agent-bridge note <name>`) to your memory exactly as written.
+7. **Report to the user:** who is connected, and which folders each side can read (`agent-bridge peers`). Tell them to start Claude with `claude-bridge` if they want colleagues' messages to pop up in the open conversation.

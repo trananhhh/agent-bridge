@@ -10,7 +10,7 @@ export const BRIDGE_HOME = process.env.BRIDGE_HOME ?? join(homedir(), '.agent-br
 export const CONFIG_PATH = join(BRIDGE_HOME, 'config.json');
 export const DB_PATH = join(BRIDGE_HOME, 'bridge.db');
 const ConfigSchema = z.object({
-    name: z.string().regex(/^[a-z0-9_-]{1,50}$/, 'name: 1-50 ký tự a-z 0-9 _ - (chữ thường, không dấu)'),
+    name: z.string().regex(/^[a-z0-9_-]{1,50}$/, 'name: 1-50 characters, lowercase a-z 0-9 _ -'),
     listenHost: z.string({ error: 'listenHost: required (Tailscale IP of this machine)' }).min(1),
     peerPort: z.number().int().positive().default(8790),
     localPort: z.number().int().positive().default(8791),
@@ -44,7 +44,7 @@ export function parseConfig(raw) {
 }
 export function readRawConfig(path = CONFIG_PATH) {
     if (!existsSync(path))
-        throw new Error(`Chưa setup (${path} không tồn tại). Chạy: agent-bridge setup`);
+        throw new Error(`Not set up yet (${path} missing). Run: agent-bridge setup`);
     return JSON.parse(readFileSync(path, 'utf8'));
 }
 export function loadConfig(path = CONFIG_PATH) {

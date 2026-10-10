@@ -26,28 +26,28 @@ export function buildClassifierPrompt(question: string, candidates: ClassifierCa
     .map((c) =>
       [
         `- id: ${c.sessionId}`,
-        `  đang mở: ${c.live ? 'có' : 'không'}`,
-        c.cwd && `  thư mục: ${c.cwd}`,
-        c.title && `  tiêu đề: ${c.title}`,
-        c.firstPrompt && `  yêu cầu đầu: ${c.firstPrompt}`,
-        c.lastPrompt && `  yêu cầu gần nhất: ${c.lastPrompt}`,
+        `  open now: ${c.live ? 'yes' : 'no'}`,
+        c.cwd && `  folder: ${c.cwd}`,
+        c.title && `  title: ${c.title}`,
+        c.firstPrompt && `  first request: ${c.firstPrompt}`,
+        c.lastPrompt && `  latest request: ${c.lastPrompt}`,
       ]
         .filter(Boolean)
         .join('\n'),
     )
     .join('\n');
   return [
-    'Bạn là bộ định tuyến tin nhắn. Bot đồng nghiệp gửi câu hỏi dưới đây.',
-    'Chọn MỘT phiên làm việc gần đây có ngữ cảnh liên quan TRỰC TIẾP để trả lời câu hỏi (cùng chủ đề, cùng feature/bug/dữ liệu).',
-    'Nếu không phiên nào liên quan rõ ràng, trả về null — một phiên mới sẽ được tạo.',
-    'Chỉ trả về JSON một dòng: {"session_id": "<id>"} hoặc {"session_id": null}. Không giải thích.',
+    'You are a message router. A colleague\'s agent sent the question below.',
+    'Pick ONE recent session whose context is DIRECTLY relevant to answering it (same topic, feature, bug or data).',
+    'If none is clearly relevant, return null — a new session will be started.',
+    'Reply with one line of JSON only: {"session_id": "<id>"} or {"session_id": null}. No explanation.',
     '',
-    'Câu hỏi:',
+    'Question:',
     '<<<',
     question.slice(0, 2000),
     '>>>',
     '',
-    'Các phiên:',
+    'Sessions:',
     list,
   ].join('\n');
 }

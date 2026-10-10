@@ -7,7 +7,7 @@ const ask = (over: Partial<PeerMessage> = {}): PeerMessage => ({
   thread_id: 't1',
   from: 'cu',
   kind: 'ask',
-  text: 'bảng orders có cột provider_id không?',
+  text: 'does the orders table have a provider_id column?',
   sent_at: '2026-10-10T00:00:00Z',
   ...over,
 });
@@ -51,15 +51,15 @@ describe('routeInbound', () => {
 
 describe('classifier', () => {
   const candidates = [
-    { sessionId: 's-bill', cwd: '/w/shop', title: 'Đối soát bill', firstPrompt: 'check bill', lastPrompt: 'tháng 9', mtimeMs: 2, live: false },
+    { sessionId: 's-bill', cwd: '/w/shop', title: 'Bill reconciliation', firstPrompt: 'check bill', lastPrompt: 'September', mtimeMs: 2, live: false },
     { sessionId: 's-live', title: 'Telegram bot /donhang', firstPrompt: 'fix label', mtimeMs: 3, live: true },
   ];
 
   it('lists every candidate id in the prompt', () => {
-    const prompt = buildClassifierPrompt('câu hỏi', candidates);
+    const prompt = buildClassifierPrompt('the question', candidates);
     expect(prompt).toContain('s-bill');
     expect(prompt).toContain('s-live');
-    expect(prompt).toContain('câu hỏi');
+    expect(prompt).toContain('the question');
     expect(prompt).toContain('/w/shop');
   });
 

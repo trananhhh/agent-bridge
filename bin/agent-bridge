@@ -8,7 +8,7 @@ while [ -L "$SOURCE" ]; do
 done
 ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a===22&&b>=13)?0:1)'; then
-  echo "agent-bridge cần Node >= 22.13 (đang có $(node -v))" >&2
+  echo "agent-bridge needs Node >= 22.13 (found $(node -v))" >&2
   exit 1
 fi
 exec node --disable-warning=ExperimentalWarning "$ROOT/dist/cli.js" "$@"

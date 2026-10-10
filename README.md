@@ -1,83 +1,83 @@
 # agent-bridge
 
-Cho agent Claude Code của bạn hỏi thẳng agent Claude Code của đồng nghiệp (máy khác, account khác), và ngược lại. Kết nối peer-to-peer qua Tailscale, không có server trung gian.
+Let your Claude Code agent ask a colleague's Claude Code agent directly, and the reverse. Each agent runs on its own machine and account. Connections are peer-to-peer over Tailscale, with no server in between.
 
-## Cài (mỗi người, một lần)
+## Install (each person, once)
 
-**1. Tailscale.** Cài app tại https://tailscale.com/download, đăng nhập bằng account của bạn.
+**1. Tailscale.** Install the app from https://tailscale.com/download and log in with your own account.
 
-**2. Share máy cho nhau, cả hai chiều.** Mỗi người làm:
-1. Mở https://login.tailscale.com/admin/machines
-2. Ở dòng máy của mình, bấm `⋯` → **Share…** → copy share link (hoặc nhập email người kia)
-3. Gửi link cho người kia; họ mở link và bấm **Accept**
+**2. Share your machines with each other, in both directions.** Each person does this:
+1. Open https://login.tailscale.com/admin/machines
+2. On your machine's row: `⋯` → **Share…** → copy the share link (or enter the other person's email)
+3. Send the link to your colleague; they open it and click **Accept**
 
-Phải share cả hai chiều, vì Tailscale chỉ cho máy được share *nhận* kết nối chứ không cho nó *chủ động gọi lại*. Kiểm tra: `tailscale status` thấy máy người kia là được.
+Both directions are required. A shared machine can *receive* connections but cannot *initiate* them. To check, run `tailscale status`; the other person's machine should be listed.
 
-**3. Cài agent-bridge.** Cần Node ≥ 22.13 và Claude Code.
+**3. agent-bridge.** You need Node ≥ 22.13 and Claude Code.
 
 ```bash
 npm install -g https://github.com/trananhhh/agent-bridge/tarball/main
 agent-bridge
 ```
 
-Lần đầu chạy, CLI hỏi tên của bạn rồi tự cài daemon chạy nền (tự bật khi đăng nhập) và đăng ký MCP cho Claude Code. Nếu macOS hỏi *"Allow node to accept incoming connections"* → bấm **Allow**.
+The first run asks for your name, starts a background daemon (it also starts at login), and registers the MCP server with Claude Code. If macOS asks to *"Allow node to accept incoming network connections"*, click **Allow**.
 
-Cập nhật bản mới: chạy lại lệnh `npm install -g …` ở trên, rồi `agent-bridge setup` để khởi động lại daemon.
+To update, run the `npm install -g …` command again, then `agent-bridge setup` to restart the daemon.
 
-## Kết nối
+## Connect
 
-**Người mời** chạy `agent-bridge`:
-1. CLI quét Tailscale và liệt kê những máy đang chạy agent-bridge; chọn người cần kết nối.
-2. Chọn folder người đó được **đọc**.
-3. Gửi yêu cầu rồi chờ.
+**The inviter** runs `agent-bridge`:
+1. The CLI scans Tailscale and lists the machines running agent-bridge. Pick the person to connect to.
+2. Choose which folders they may **read**.
+3. Send the request and wait.
 
-**Người được mời** nhận thông báo trên macOS, chạy `agent-bridge`:
-1. CLI hiện ai đang mời, kèm danh tính Tailscale thật (không phải tên tự khai) và folder họ chia sẻ.
-2. Chấp nhận, rồi chọn folder người mời được **đọc**.
+**The invitee** gets a macOS notification and runs `agent-bridge`:
+1. The CLI shows who is asking, with their verified Tailscale identity (not a self-declared name), and the folders they share.
+2. Accept, then choose which folders the inviter may **read**.
 
-Xong thì **cả hai** CLI đều in ra một đoạn hướng dẫn (đã tự copy vào clipboard). Dán đoạn đó vào Claude Code để agent lưu vào memory: nó nói chuyện được với ai, hỏi về folder nào, và dùng tool gì.
+When the connection is made, **both** CLIs print a short note and copy it to the clipboard. Paste the note into Claude Code so your agent saves to memory who it can talk to, about which folders, and with which tools.
 
-## Dùng
+## Use
 
-Cứ nói tự nhiên với Claude Code: *"hỏi agent của Cừ xem bảng orders có cột provider_id không"*.
+Talk to Claude Code as usual: *"ask Cu's agent whether the orders table has a provider_id column"*.
 
-- **Muốn tin của đồng nghiệp tự hiện trong conversation đang mở:** mở Claude bằng `claude-bridge` thay cho `claude`. Lệnh này thêm flag `--dangerously-load-development-channels`, và mỗi lần mở phải xác nhận một cảnh báo, vì [Channels](https://code.claude.com/docs/en/channels-reference) của Claude Code đang research preview.
-- **Session thường hoặc desktop app:** vẫn dùng được; Claude tự gọi `peer_inbox` để chờ câu trả lời.
-- **Đồng nghiệp hỏi lúc bạn không mở session nào:** daemon tự mở một session chỉ đọc để trả lời. Nếu câu hỏi liên quan một session gần đây (48h) thì tiếp tục ngay trong session đó.
+- **To see colleagues' messages pop up in the conversation you have open:** start Claude with `claude-bridge` instead of `claude`. This adds `--dangerously-load-development-channels`, and you confirm a warning each launch, because Claude Code [channels](https://code.claude.com/docs/en/channels-reference) are in research preview.
+- **Regular sessions and the desktop app** work too. Claude polls `peer_inbox` for answers.
+- **When a colleague asks while you have no session open,** the daemon answers in a read-only session. If the question relates to one of your recent sessions (last 48h), it continues in that session.
 
-## Quyền
+## Permissions
 
-- Mỗi kết nối, mỗi bên tự chọn folder bên kia được đọc. Đọc được **mọi thứ** trong đó, kể cả `.env`.
-- Session trả lời đồng nghiệp chạy bằng `claude --restricted --add-dir <folder>`: không có Write/Edit/Bash, và đọc ngoài folder bị CLI chặn. Đã kiểm chứng ở mức tool, không phụ thuộc model có tự giác hay không.
-- Cần ghi/sửa → agent trả lời rằng chủ máy phải tự làm. Trong session bạn đang mở, Claude Code vẫn hỏi bạn trước mọi thao tác ghi.
+- For each connection, each side chooses which of its folders the other side may read. The other side can read **everything** in those folders, including any `.env` file.
+- Sessions that answer a colleague run as `claude --restricted --add-dir <folder>`. They have no Write, Edit or Bash, and the CLI blocks reads outside the shared folders. This is enforced at the tool level and has been verified; it does not rely on the model behaving.
+- If a request needs a write, the agent replies that the machine's owner must do it. In your own open session, Claude Code still asks you before any write.
 
-## Lệnh
+## Commands
 
 ```
-agent-bridge                 wizard: setup → xử lý yêu cầu đang chờ → kết nối người mới
-agent-bridge connect [ip]    kết nối (nhập IP Tailscale nếu quét không thấy)
-agent-bridge requests        chấp nhận / từ chối yêu cầu đang chờ
-agent-bridge peers           ai đã kết nối, mỗi bên đọc được gì
-agent-bridge note <tên>      in lại đoạn hướng dẫn cho Claude Code
-agent-bridge folders <tên>   đổi folder người đó được đọc
-agent-bridge remove <tên>    ngắt kết nối
-agent-bridge status          daemon + từng kết nối online/offline
-agent-bridge uninstall       tắt daemon, gỡ MCP
+agent-bridge                 wizard: setup → pending requests → connect someone new
+agent-bridge connect [ip]    connect (give their Tailscale IP if the scan can't see them)
+agent-bridge requests        accept / decline pending requests
+agent-bridge peers           who is connected and what each side can read
+agent-bridge note <name>     print the Claude Code note again
+agent-bridge folders <name>  change which folders that person can read
+agent-bridge remove <name>   disconnect
+agent-bridge status          daemon + each connection online/offline
+agent-bridge uninstall       stop the daemon, remove the MCP server
 ```
 
-## Gỡ rối
+## Troubleshooting
 
-| Triệu chứng | Kiểm tra |
+| Symptom | Check |
 |---|---|
-| `connect` không thấy ai | Đã share Tailscale **hai chiều** chưa (`tailscale status`)? Bên kia đã chạy `agent-bridge` lần đầu chưa? |
-| Thấy máy nhưng không gửi/nhận được | Firewall macOS chặn `node` → System Settings → Network → Firewall → Options |
-| Đồng nghiệp hỏi mà không ai trả lời | `agent-bridge status` trên máy họ; log ở `~/.agent-bridge/daemon.log` |
+| `connect` finds nobody | Is Tailscale shared **both ways** (`tailscale status`)? Has the other person run `agent-bridge` once? |
+| Machine is visible but requests fail | The macOS firewall may be blocking `node`: System Settings → Network → Firewall → Options |
+| A colleague's question gets no answer | Run `agent-bridge status` on their machine; check the log at `~/.agent-bridge/daemon.log` |
 
-Dữ liệu nằm trong `~/.agent-bridge/`, gồm `config.json`, `bridge.db` (kết nối, lịch sử tin, hàng đợi) và `daemon.log`. Peer đang offline thì tin xếp hàng và tự gửi lại khi họ online. Chi phí trả lời tính vào account Claude của **bên trả lời**.
+Everything lives in `~/.agent-bridge/`: `config.json`, `bridge.db` (connections, message history, queue) and `daemon.log`. Messages to an offline peer are queued and retried until they come back. Answers are billed to the **answering** side's Claude account.
 
-## Phát triển
+## Development
 
 ```bash
 npm install && npm test && npm run typecheck
-npm run build   # dist/ được commit để `npm i -g github:…` không cần build — build trước khi commit
+npm run build   # dist/ is committed so `npm install -g <tarball>` needs no build step — rebuild before committing
 ```

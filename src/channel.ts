@@ -39,18 +39,18 @@ export async function runChannel(): Promise<void> {
     process.stderr.write(`${JSON.stringify({ t: new Date().toISOString(), event, conn: connId, ...data })}\n`);
 
   const peerLines = peers.length
-    ? peers.map((p) => `- ${p.name}: hỏi được về ${p.remote_folders.map((f) => basename(f)).join(', ') || '(chưa rõ folder)'}`).join('\n')
-    : '- (chưa kết nối với ai — người dùng chạy `agent-bridge connect` trong terminal)';
-  const instructions = `agent-bridge nối bạn với agent Claude Code của đồng nghiệp trên máy khác. Đã kết nối:
+    ? peers.map((p) => `- ${p.name}: can answer about ${p.remote_folders.map((f) => basename(f)).join(', ') || '(unknown folders)'}`).join('\n')
+    : '- (nobody yet — the user runs `agent-bridge connect` in a terminal)';
+  const instructions = `agent-bridge connects you to colleagues' Claude Code agents on other machines. Connected:
 ${peerLines}
-Khi cần thông tin/xác nhận từ phía một người trong danh sách (về code, dữ liệu, quyết định trong các folder họ chia sẻ), tự dùng ask_peer thay vì bảo người dùng đi hỏi. Viết câu hỏi tự đủ ngữ cảnh (bên kia không thấy cuộc hội thoại này).
-Tools: ask_peer (hỏi), reply (trả lời một thread), peer_inbox (lấy câu trả lời đang chờ), list_peers.
+When you need information or confirmation from someone on this list (code, data, decisions in the folders they share), use ask_peer yourself instead of telling the user to go ask. Write self-contained questions (they can't see this conversation).
+Tools: ask_peer (ask), reply (answer a thread), peer_inbox (collect waiting answers), list_peers.
 ${
   isLive
-    ? `Phiên LIVE: tin đến tự hiện dạng <channel source="agent-bridge" from="..." thread_id="..." kind="ask|reply" folders="...">.
-- kind="ask": đồng nghiệp hỏi. CHỈ tra cứu trong các folder ở thuộc tính folders rồi gọi reply với đúng thread_id. Không đọc/tiết lộ gì ngoài các folder đó. Thao tác ghi phải hỏi chủ máy trước.
-- kind="reply": câu trả lời cho ask_peer trước đó của bạn — dùng nó để tiếp tục việc đang làm.`
-    : 'Phiên này không nhận push: sau ask_peer, gọi peer_inbox với thread_id và wait_seconds (vd 120) để chờ câu trả lời.'
+    ? `LIVE session: messages arrive as <channel source="agent-bridge" from="..." thread_id="..." kind="ask|reply" folders="...">.
+- kind="ask": a colleague asks. Look things up ONLY inside the folders in the folders attribute, then call reply with the same thread_id. Don't read or reveal anything outside those folders. Ask the owner before any write.
+- kind="reply": the answer to your earlier ask_peer — use it to continue your task.`
+    : 'This session does not receive pushes: after ask_peer, call peer_inbox with the thread_id and wait_seconds (e.g. 120) to wait for the answer.'
 }`;
 
   const mcp = new Server(
@@ -64,7 +64,7 @@ ${
     try {
       res = await fetch(`${localUrl}${path}`, init);
     } catch {
-      throw new Error(`agent-bridge daemon không chạy ở ${localUrl}. Chạy trong terminal: agent-bridge setup`);
+      throw new Error(`agent-bridge daemon is not running at ${localUrl}. Run in a terminal: agent-bridge setup`);
     }
     const body = (await res.json()) as T & { error?: string };
     if (!res.ok) throw new Error(body.error ?? `daemon responded ${res.status}`);
@@ -82,20 +82,20 @@ ${
     tools: [
       {
         name: 'ask_peer',
-        description: 'Gửi câu hỏi/yêu cầu sang bot Claude Code của đồng nghiệp. Trả về thread_id; truyền thread_id cũ để hỏi tiếp cùng mạch.',
+        description: 'Send a question or request to a colleague\'s Claude Code agent. Returns a thread_id; pass an existing thread_id to follow up in the same thread.',
         inputSchema: {
           type: 'object',
           properties: {
-            text: { type: 'string', description: 'Nội dung tự đủ ngữ cảnh' },
-            to: { type: 'string', description: 'Tên peer (xem list_peers). Bỏ trống nếu chỉ có 1 peer hoặc đang hỏi tiếp thread cũ.' },
-            thread_id: { type: 'string', description: 'Thread cũ để hỏi tiếp (tuỳ chọn)' },
+            text: { type: 'string', description: 'Self-contained message' },
+            to: { type: 'string', description: 'Peer name (see list_peers). Omit when there is only one peer or when following up on a thread.' },
+            thread_id: { type: 'string', description: 'Existing thread to follow up on (optional)' },
           },
           required: ['text'],
         },
       },
       {
         name: 'reply',
-        description: 'Trả lời một tin kind="ask" từ bot bên kia, dùng đúng thread_id của tin đó.',
+        description: 'Answer a kind="ask" message from a colleague\'s agent, using that message\'s thread_id.',
         inputSchema: {
           type: 'object',
           properties: { thread_id: { type: 'string' }, text: { type: 'string' } },
@@ -104,18 +104,18 @@ ${
       },
       {
         name: 'peer_inbox',
-        description: 'Lấy các câu trả lời từ bot bên kia chưa đọc. Có thể chờ tối đa wait_seconds cho một thread.',
+        description: 'Collect unread answers from colleagues\' agents. Optionally wait up to wait_seconds for one thread.',
         inputSchema: {
           type: 'object',
           properties: {
             thread_id: { type: 'string' },
-            wait_seconds: { type: 'number', description: `0-${MAX_WAIT_S}, mặc định 0` },
+            wait_seconds: { type: 'number', description: `0-${MAX_WAIT_S}, default 0` },
           },
         },
       },
       {
         name: 'list_peers',
-        description: 'Liệt kê người đã kết nối: mình hỏi được họ về folder nào, họ đọc được folder nào của mình.',
+        description: 'List connections: which folders you can ask each peer about, and which of yours they can read.',
         inputSchema: { type: 'object', properties: {} },
       },
     ],
@@ -134,13 +134,13 @@ ${
             thread_id: args.thread_id ? String(args.thread_id) : undefined,
           });
           return text(
-            `${r.status === 'sent' ? `Đã gửi tới ${r.to}` : `${r.to} đang offline — đã xếp hàng, sẽ tự gửi lại`} · thread_id=${r.thread_id}` +
-              (isLive ? '' : '\nGọi peer_inbox với thread_id này để nhận câu trả lời.'),
+            `${r.status === 'sent' ? `Sent to ${r.to}` : `${r.to} is offline — queued, will retry automatically`} · thread_id=${r.thread_id}` +
+              (isLive ? '' : '\nCall peer_inbox with this thread_id to get the answer.'),
           );
         }
         case 'reply': {
           const r = await sendLocal({ kind: 'reply', text: String(args.text ?? ''), thread_id: String(args.thread_id ?? '') });
-          return text(`${r.status === 'sent' ? `Đã trả lời ${r.to}` : `Đã xếp hàng (${r.to} offline)`} · thread_id=${r.thread_id}`);
+          return text(`${r.status === 'sent' ? `Replied to ${r.to}` : `Queued (${r.to} offline)`} · thread_id=${r.thread_id}`);
         }
         case 'peer_inbox': {
           const thread = args.thread_id ? String(args.thread_id) : '';
@@ -148,8 +148,8 @@ ${
           const qs = new URLSearchParams(thread ? { thread } : {});
           for (;;) {
             const { messages } = await local<{ messages: PeerMessage[] }>(`/local/inbox?${qs}`);
-            if (messages.length) return text(messages.map((m) => `[${m.kind} từ ${m.from} · thread ${m.thread_id}]\n${m.text}`).join('\n\n'));
-            if (Date.now() >= deadline) return text('Chưa có câu trả lời mới.');
+            if (messages.length) return text(messages.map((m) => `[${m.kind} from ${m.from} · thread ${m.thread_id}]\n${m.text}`).join('\n\n'));
+            if (Date.now() >= deadline) return text('No new answers yet.');
             await new Promise((r) => setTimeout(r, 3000));
           }
         }
@@ -157,15 +157,15 @@ ${
           const r = await local<{ peers: { name: string; folders: string[]; remote_folders: string[] }[] }>('/local/peers');
           return text(
             r.peers.length
-              ? r.peers.map((p) => `- ${p.name}: hỏi được về ${p.remote_folders.join(', ') || '?'} · họ đọc được của mình: ${p.folders.join(', ')}`).join('\n')
-              : 'Chưa kết nối với ai (người dùng chạy `agent-bridge connect`).',
+              ? r.peers.map((p) => `- ${p.name}: you can ask about ${p.remote_folders.join(', ') || '?'} · they can read yours: ${p.folders.join(', ')}`).join('\n')
+              : 'Not connected to anyone (the user runs `agent-bridge connect`).',
           );
         }
         default:
           throw new Error(`unknown tool: ${req.params.name}`);
       }
     } catch (err) {
-      return { ...text(`Lỗi: ${(err as Error).message}`), isError: true };
+      return { ...text(`Error: ${(err as Error).message}`), isError: true };
     }
   });
 

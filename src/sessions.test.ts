@@ -38,10 +38,10 @@ describe('listRecentSessions', () => {
       '-w-shop',
       'aaa',
       [
-        user('/w/shop', 'Đối soát bill KHANHHOANG'),
+        user('/w/shop', 'Reconcile KHANHHOANG bills'),
         'not json',
-        { type: 'custom-title', customTitle: 'Đối soát bill' },
-        user('/w/shop', [{ type: 'text', text: 'check lại tháng 9' }]),
+        { type: 'custom-title', customTitle: 'Bill reconciliation' },
+        user('/w/shop', [{ type: 'text', text: 'recheck September' }]),
         user('/w/shop', [{ type: 'tool_result', content: 'x' }]),
       ],
       now - 60_000,
@@ -56,9 +56,9 @@ describe('listRecentSessions', () => {
     expect(sessions[0].cwd).toBe('/w/shop/apps/api');
     expect(sessions[1]).toMatchObject({
       cwd: '/w/shop',
-      title: 'Đối soát bill',
-      firstPrompt: 'Đối soát bill KHANHHOANG',
-      lastPrompt: 'check lại tháng 9',
+      title: 'Bill reconciliation',
+      firstPrompt: 'Reconcile KHANHHOANG bills',
+      lastPrompt: 'recheck September',
     });
   });
 

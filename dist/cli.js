@@ -15,24 +15,24 @@ const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.
 const LOG_PATH = join(BRIDGE_HOME, 'daemon.log');
 const INSTALL_CMD = 'npm install -g https://github.com/trananhhh/agent-bridge/tarball/main';
 const WAIT_FOR_ANSWER_MS = 15 * 60_000;
-const TAILSCALE_GUIDE = `Kết nối Tailscale với đồng nghiệp (mỗi người một account, làm 1 lần):
-  1. Mở https://login.tailscale.com/admin/machines
-  2. Ở dòng máy của bạn: bấm ⋯ → "Share…" → copy share link (hoặc nhập email người kia)
-  3. Gửi link cho đồng nghiệp → họ mở link, bấm Accept
-  4. Đồng nghiệp làm y hệt với máy của họ và gửi link cho bạn → bạn bấm Accept
-  Phải share CẢ HAI CHIỀU: Tailscale chỉ cho máy được share nhận kết nối, không cho nó chủ động gọi lại.`;
-const HELP = `agent-bridge ${VERSION} — cho Claude Code trên các máy khác nhau nói chuyện với nhau (qua Tailscale)
+const TAILSCALE_GUIDE = `Link Tailscale with a colleague (separate accounts, once per pair):
+  1. Open https://login.tailscale.com/admin/machines
+  2. On your machine's row: ⋯ → "Share…" → copy the share link (or enter their email)
+  3. Send the link to your colleague → they open it and click Accept
+  4. They do the same for their machine and send you the link → you click Accept
+  Share BOTH ways: a shared machine can receive connections but cannot initiate them.`;
+const HELP = `agent-bridge ${VERSION} — let Claude Code agents on different machines talk to each other (over Tailscale)
 
-  agent-bridge                  wizard: setup → xử lý yêu cầu kết nối → kết nối người mới
-  agent-bridge setup            đặt tên, chạy daemon nền, đăng ký MCP cho Claude Code
-  agent-bridge connect [ip]     tìm máy có agent-bridge trên Tailscale (hoặc nhập IP), chọn folder, gửi yêu cầu
-  agent-bridge requests         xem & chấp nhận yêu cầu kết nối đang chờ
-  agent-bridge peers            danh sách kết nối
-  agent-bridge note <tên>       in lại đoạn hướng dẫn để dán cho Claude Code
-  agent-bridge folders <tên>    đổi folder người đó được đọc
-  agent-bridge remove <tên>     ngắt kết nối
-  agent-bridge status           kiểm tra daemon, Tailscale, từng kết nối
-  agent-bridge uninstall        tắt daemon, gỡ MCP (giữ ~/.agent-bridge)
+  agent-bridge                  wizard: setup → handle pending requests → connect someone new
+  agent-bridge setup            pick a name, start the background daemon, register the MCP server
+  agent-bridge connect [ip]     find agent-bridge machines on Tailscale (or give an IP), pick folders, send a request
+  agent-bridge requests         review & accept pending connection requests
+  agent-bridge peers            list connections
+  agent-bridge note <name>      print the note to paste into Claude Code again
+  agent-bridge folders <name>   change which folders that person can read
+  agent-bridge remove <name>    disconnect
+  agent-bridge status           check daemon, Tailscale and each connection
+  agent-bridge uninstall        stop the daemon, remove the MCP server (keeps ~/.agent-bridge)
 `;
 // ── small terminal helpers ────────────────────────────────────────────────
 // One reader for the whole process: piped input (scripts, Claude running the CLI) arrives before prompts are asked.
@@ -63,7 +63,7 @@ async function ask(question, fallback) {
         process.stdout.write('\n');
         if (fallback !== undefined)
             return fallback;
-        throw new Error('hết input');
+        throw new Error('no more input');
     }
     if (!process.stdin.isTTY)
         process.stdout.write(`${line}\n`);
@@ -71,16 +71,16 @@ async function ask(question, fallback) {
 }
 async function confirm(question, defaultYes = true) {
     const a = (await ask(`${question} (${defaultYes ? 'Y/n' : 'y/N'})`)).toLowerCase();
-    return a ? a.startsWith('y') || a === 'có' || a === 'co' : defaultYes;
+    return a ? a.startsWith('y') : defaultYes;
 }
 async function askFolders(question) {
     for (;;) {
-        const raw = await ask(`${question} — đường dẫn, cách nhau bởi dấu phẩy`, process.cwd());
+        const raw = await ask(`${question} — paths, comma-separated`, process.cwd());
         const folders = raw.split(',').map((f) => f.trim()).filter(Boolean).map((f) => expandPath(f));
         const missing = folders.filter((f) => !existsSync(f) || !statSync(f).isDirectory());
         if (folders.length && missing.length === 0)
             return [...new Set(folders)];
-        console.log(`  ✗ không tồn tại: ${missing.join(', ') || '(trống)'}`);
+        console.log(`  ✗ not found: ${missing.join(', ') || '(empty)'}`);
     }
 }
 function sh(bin, args, input) {
@@ -96,9 +96,9 @@ function tryRun(bin, args, input) {
 }
 function printNote(note) {
     const line = '─'.repeat(60);
-    console.log(`\n${line}\nGửi đoạn dưới đây cho Claude Code của bạn:\n${line}\n${note}\n${line}`);
+    console.log(`\n${line}\nPaste this into your Claude Code:\n${line}\n${note}\n${line}`);
     if (process.platform === 'darwin' && tryRun('pbcopy', [], note) !== undefined)
-        console.log('(đã copy vào clipboard)');
+        console.log('(copied to clipboard)');
 }
 // ── daemon API ─────────────────────────────────────────────────────────────
 async function api(path, body) {
@@ -113,7 +113,7 @@ async function api(path, body) {
         });
     }
     catch {
-        throw new Error('daemon chưa chạy. Chạy: agent-bridge setup');
+        throw new Error('daemon is not running. Run: agent-bridge setup');
     }
     const json = (await res.json());
     if (!res.ok)
@@ -179,61 +179,61 @@ async function waitForDaemon(port) {
 async function cmdSetup(argv) {
     const { values } = parseArgs({ args: argv, options: { name: { type: 'string' } } });
     if (CLI_PATH.includes('/_npx/')) {
-        throw new Error(`agent-bridge cần chạy nền nên phải cài global, không chạy qua npx:\n  ${INSTALL_CMD}\n  agent-bridge`);
+        throw new Error(`agent-bridge runs a background daemon, so install it globally instead of using npx:\n  ${INSTALL_CMD}\n  agent-bridge`);
     }
     const ts = await tailscaleStatus();
     const selfIp = ts ? parseTailscaleStatus(ts).selfIp : undefined;
     if (!selfIp)
-        throw new Error('Tailscale chưa cài/chưa đăng nhập. Cài https://tailscale.com/download, đăng nhập, rồi chạy lại.');
+        throw new Error('Tailscale is not installed or not logged in. Install https://tailscale.com/download, log in, then run this again.');
     const claudeBin = detectClaudeBin();
     if (!claudeBin)
-        throw new Error('không tìm thấy lệnh `claude`. Cài Claude Code trước: https://claude.com/claude-code');
+        throw new Error('`claude` not found. Install Claude Code first: https://claude.com/claude-code');
     const existing = existsSync(CONFIG_PATH) ? readRawConfig() : undefined;
     const suggested = (existing?.name ?? userInfo().username).toLowerCase().replace(/[^a-z0-9_-]/g, '');
-    let name = values.name ?? (await ask('Tên của bạn (đồng nghiệp sẽ thấy; chữ thường, không dấu)', suggested));
+    let name = values.name ?? (await ask('Your name (shown to colleagues; lowercase, no spaces)', suggested));
     while (!/^[a-z0-9_-]{1,50}$/.test(name))
-        name = await ask('Tên chỉ gồm a-z 0-9 _ -', suggested);
+        name = await ask('Use only a-z 0-9 _ -', suggested);
     const raw = { ...existing, name, listenHost: selfIp, claudeBin };
     writeRawConfig(raw);
-    console.log(`✓ tên: ${name} · Tailscale ${selfIp}`);
+    console.log(`✓ name: ${name} · Tailscale ${selfIp}`);
     if (process.platform === 'darwin') {
         installService();
-        console.log(`✓ daemon chạy nền, tự bật khi đăng nhập (log: ${LOG_PATH})`);
+        console.log(`✓ daemon running in the background, starts at login (log: ${LOG_PATH})`);
     }
     else {
-        console.log('! Linux: tự chạy `agent-bridge daemon` dưới systemd/tmux để daemon luôn bật');
+        console.log('! Linux: keep `agent-bridge daemon` running under systemd/tmux yourself');
     }
     registerMcp(claudeBin);
-    console.log('✓ đã đăng ký MCP "agent-bridge" cho Claude Code');
+    console.log('✓ MCP server "agent-bridge" registered for Claude Code');
     if (!(await waitForDaemon(raw.localPort ?? 8791)))
-        console.log(`! daemon chưa phản hồi — xem log ${LOG_PATH}`);
-    console.log('  Nếu macOS hỏi "Allow node to accept incoming connections" → bấm Allow.');
+        console.log(`! daemon not responding yet — check ${LOG_PATH}`);
+    console.log('  If macOS asks to "Allow node to accept incoming connections" → click Allow.');
 }
 // ── connect / requests ─────────────────────────────────────────────────────
 async function cmdConnect(argv) {
     const cfg = loadConfig();
     if (argv[0])
         return connectTo(await bridgeAt(argv[0], cfg.peerPort));
-    console.log('Đang tìm máy có agent-bridge trên Tailscale…');
+    console.log('Looking for agent-bridge machines on Tailscale…');
     const ts = await tailscaleStatus();
     if (!ts)
-        throw new Error('không đọc được Tailscale (app có đang chạy không?)');
+        throw new Error('cannot read Tailscale status (is the app running?)');
     const { peers: online } = parseTailscaleStatus(ts);
     const connected = new Set((await api('/local/peers')).peers.map((p) => p.name));
     const found = (await findBridges(online, { port: cfg.peerPort })).filter((b) => b.name !== cfg.name);
     if (found.length === 0) {
-        console.log(`\nChưa thấy ai. Máy đang online trong Tailscale của bạn: ${online.map((p) => p.host).join(', ') || '(không có)'}`);
-        console.log(`- Không thấy máy đồng nghiệp ở trên → chưa share Tailscale:\n\n${TAILSCALE_GUIDE}\n`);
-        console.log('- Có máy họ nhưng vẫn không thấy → họ chưa cài/chưa chạy `agent-bridge setup`, hoặc firewall chặn node.');
-        if (process.platform === 'darwin' && (await confirm('Mở trang Tailscale admin để share máy?')))
+        console.log(`\nNobody found. Machines online in your Tailscale: ${online.map((p) => p.host).join(', ') || '(none)'}`);
+        console.log(`- Colleague's machine not listed → Tailscale isn't shared yet:\n\n${TAILSCALE_GUIDE}\n`);
+        console.log('- Their machine is listed but not found → they haven\'t run `agent-bridge` yet, or a firewall blocks node.');
+        if (process.platform === 'darwin' && (await confirm('Open the Tailscale admin page to share your machine?')))
             tryRun('open', ['https://login.tailscale.com/admin/machines']);
         return;
     }
     console.log('');
-    found.forEach((b, i) => console.log(`  ${i + 1}) ${b.name}  — máy ${b.host} (${b.ip})${connected.has(b.name) ? '  [đã kết nối]' : ''}`));
+    found.forEach((b, i) => console.log(`  ${i + 1}) ${b.name}  — machine ${b.host} (${b.ip})${connected.has(b.name) ? '  [connected]' : ''}`));
     let pick;
     do
-        pick = Number(await ask('Kết nối với số', found.length === 1 ? '1' : undefined));
+        pick = Number(await ask('Connect to number', found.length === 1 ? '1' : undefined));
     while (!(pick >= 1 && pick <= found.length));
     await connectTo(found[pick - 1]);
 }
@@ -242,100 +242,100 @@ async function bridgeAt(arg, port) {
     const url = arg.includes('://') ? arg.replace(/\/$/, '') : /:\d+$/.test(arg) ? `http://${arg}` : `http://${arg}:${port}`;
     const [hit] = await findBridges([{ ip: hostOf(url), host: hostOf(url) }], { port: Number(new URL(url).port) || port });
     if (!hit)
-        throw new Error(`${url} không chạy agent-bridge (hoặc không tới được qua Tailscale)`);
+        throw new Error(`${url} is not running agent-bridge (or is unreachable over Tailscale)`);
     return hit;
 }
 async function connectTo(target) {
-    const folders = await askFolders(`Folder ${target.name} được ĐỌC (chỉ đọc; đọc được cả .env trong đó)`);
-    if (!(await confirm(`Gửi yêu cầu kết nối tới ${target.name}, cho họ đọc ${folders.join(', ')}?`)))
+    const folders = await askFolders(`Folders ${target.name} may READ (read-only; includes any .env inside)`);
+    if (!(await confirm(`Send a connection request to ${target.name}, letting them read ${folders.join(', ')}?`)))
         return;
     const { request_id } = await api('/local/connect', { url: target.url, folders });
-    console.log(`⏳ Đã gửi. Đang chờ ${target.name} chấp nhận — máy họ hiện thông báo, họ chạy "agent-bridge" để chấp nhận.`);
-    console.log('   (Ctrl+C để thoát; nếu họ chấp nhận sau, chạy "agent-bridge note ' + target.name + '" để lấy hướng dẫn)');
+    console.log(`⏳ Sent. Waiting for ${target.name} to accept — they get a notification and run "agent-bridge" to accept.`);
+    console.log('   (Ctrl+C to stop waiting; if they accept later, run "agent-bridge note ' + target.name + '" for the note)');
     const deadline = Date.now() + WAIT_FOR_ANSWER_MS;
     while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 2000));
         const r = await api(`/local/requests/${request_id}`);
         if (r.status === 'declined')
-            return console.log(`✗ ${target.name} đã từ chối.`);
+            return console.log(`✗ ${target.name} declined.`);
         if (r.status === 'accepted') {
-            console.log(`✓ Đã kết nối với ${target.name}. Bạn hỏi được họ về: ${(r.remote_folders ?? []).join(', ')}`);
+            console.log(`✓ Connected to ${target.name}. You can ask them about: ${(r.remote_folders ?? []).join(', ')}`);
             const identity = await tailscaleWhois(target.ip);
             printNote(buildAgentNote({ peer: target.name, identity, theirFolders: r.remote_folders ?? [], myFolders: folders }));
             return;
         }
     }
-    console.log('Hết thời gian chờ. Yêu cầu vẫn còn — khi họ chấp nhận, chạy "agent-bridge note ' + target.name + '".');
+    console.log('Stopped waiting. The request stays open — once they accept, run "agent-bridge note ' + target.name + '".');
 }
 async function handleRequests() {
     const { incoming } = await api('/local/requests');
     for (const r of incoming) {
-        console.log(`\n📨 ${r.name}${r.identity ? ` (${r.identity})` : ''} muốn kết nối.`);
-        console.log(`   ${r.name} cho bạn hỏi về: ${r.folders.join(', ') || '(không có folder)'}`);
-        if (!(await confirm('Chấp nhận?'))) {
+        console.log(`\n📨 ${r.name}${r.identity ? ` (${r.identity})` : ''} wants to connect.`);
+        console.log(`   ${r.name} lets you ask about: ${r.folders.join(', ') || '(no folders)'}`);
+        if (!(await confirm('Accept?'))) {
             await api('/local/requests/answer', { request_id: r.id, accept: false });
-            console.log('   ✗ đã từ chối');
+            console.log('   ✗ declined');
             continue;
         }
-        const folders = await askFolders(`Folder ${r.name} được ĐỌC (chỉ đọc; đọc được cả .env trong đó)`);
+        const folders = await askFolders(`Folders ${r.name} may READ (read-only; includes any .env inside)`);
         await api('/local/requests/answer', { request_id: r.id, accept: true, folders });
-        console.log(`✓ Đã kết nối với ${r.name}.`);
+        console.log(`✓ Connected to ${r.name}.`);
         printNote(buildAgentNote({ peer: r.name, identity: r.identity, theirFolders: r.folders, myFolders: folders }));
     }
     return incoming.length;
 }
 async function cmdRequests() {
     if ((await handleRequests()) === 0)
-        console.log('Không có yêu cầu kết nối nào đang chờ.');
+        console.log('No pending connection requests.');
 }
 // ── peers ──────────────────────────────────────────────────────────────────
 async function cmdPeers() {
     const { peers } = await api('/local/peers');
     if (!peers.length)
-        return console.log('Chưa kết nối với ai. Chạy: agent-bridge connect');
+        return console.log('Not connected to anyone. Run: agent-bridge connect');
     for (const p of peers) {
         console.log(`${p.name}  (${hostOf(p.url)})`);
-        console.log(`  bạn hỏi được về: ${p.remote_folders.join(', ') || '?'}`);
-        console.log(`  họ đọc được:     ${p.folders.join(', ')}`);
+        console.log(`  you can ask about: ${p.remote_folders.join(', ') || '?'}`);
+        console.log(`  they can read:     ${p.folders.join(', ')}`);
     }
 }
 async function cmdNote(argv) {
     const { peers } = await api('/local/peers');
     const p = peers.find((x) => x.name === argv[0]);
     if (!p)
-        throw new Error(`không có kết nối "${argv[0] ?? ''}". Xem: agent-bridge peers`);
+        throw new Error(`no connection named "${argv[0] ?? ''}". See: agent-bridge peers`);
     const identity = await tailscaleWhois(hostOf(p.url));
     printNote(buildAgentNote({ peer: p.name, identity, theirFolders: p.remote_folders, myFolders: p.folders }));
 }
 async function cmdFolders(argv) {
     if (!argv[0])
-        throw new Error('usage: agent-bridge folders <tên>');
-    const folders = await askFolders(`Folder ${argv[0]} được ĐỌC`);
+        throw new Error('usage: agent-bridge folders <name>');
+    const folders = await askFolders(`Folders ${argv[0]} may READ`);
     await api('/local/peers/folders', { name: argv[0], folders });
-    console.log(`✓ ${argv[0]} giờ chỉ đọc được: ${folders.join(', ')}`);
+    console.log(`✓ ${argv[0]} can now read only: ${folders.join(', ')}`);
 }
 async function cmdRemove(argv) {
     await api('/local/peers/remove', { name: argv[0] });
-    console.log(`✓ đã ngắt kết nối với ${argv[0]}`);
+    console.log(`✓ disconnected from ${argv[0]}`);
 }
 async function cmdStatus() {
     const cfg = loadConfig();
     console.log(`agent-bridge ${VERSION} · ${cfg.name} · http://${cfg.listenHost}:${cfg.peerPort}`);
-    console.log(`service: ${serviceInstalled() ? `launchd (log ${LOG_PATH})` : 'chưa cài'}`);
+    console.log(`service: ${serviceInstalled() ? `launchd (log ${LOG_PATH})` : 'not installed'}`);
     let peers = [];
     try {
         const s = await api('/local/status');
         peers = (await api('/local/peers')).peers;
-        console.log(`daemon:  đang chạy · session live ${s.live} · tin chờ gửi ${s.outbox}`);
+        console.log(`daemon:  running · live sessions ${s.live} · queued messages ${s.outbox}`);
     }
     catch {
-        console.log('daemon:  KHÔNG chạy → agent-bridge setup');
+        console.log('daemon:  NOT running → agent-bridge setup');
     }
     for (const p of peers) {
-        let state = 'offline / không tới được';
+        let state = 'offline / unreachable';
         try {
             const h = (await (await fetch(`${p.url}/health`, { signal: AbortSignal.timeout(4000) })).json());
-            state = h.name === p.name ? 'online' : `online nhưng tự nhận là "${h.name}"`;
+            state = h.name === p.name ? 'online' : `online but reports itself as "${h.name}"`;
         }
         catch {
             // stays offline
@@ -348,7 +348,7 @@ function cmdUninstall() {
     rmSync(PLIST_PATH, { force: true });
     const claudeBin = existsSync(CONFIG_PATH) ? loadConfig().claudeBin : 'claude';
     tryRun(claudeBin, ['mcp', 'remove', '-s', 'user', 'agent-bridge']);
-    console.log(`✓ đã tắt daemon và gỡ MCP. Dữ liệu còn ở ${BRIDGE_HOME} (xoá thư mục đó để quên mọi kết nối).`);
+    console.log(`✓ daemon stopped and MCP server removed. Data kept in ${BRIDGE_HOME} (delete it to forget all connections).`);
 }
 async function cmdHome() {
     if (!existsSync(CONFIG_PATH)) {
@@ -359,8 +359,8 @@ async function cmdHome() {
         return;
     const { peers } = await api('/local/peers');
     if (peers.length) {
-        console.log(`Đã kết nối: ${peers.map((p) => p.name).join(', ')}`);
-        if (!(await confirm('Kết nối với người mới?')))
+        console.log(`Connected: ${peers.map((p) => p.name).join(', ')}`);
+        if (!(await confirm('Connect someone new?')))
             return;
     }
     await cmdConnect([]);

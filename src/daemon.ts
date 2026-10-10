@@ -73,9 +73,9 @@ const PEER_NAME = /^[a-z0-9_-]{1,50}$/;
 const CLASSIFIER_TIMEOUT_MS = 120_000;
 
 const headlessSystemPrompt = (peer: string) =>
-  `Bạn đang trả lời tin nhắn từ bot Claude Code của "${peer}" qua agent-bridge; không có người ngồi trước màn hình. ` +
-  'Bạn chỉ có quyền ĐỌC trong các thư mục được chia sẻ với người này. Không ghi được gì; nếu yêu cầu cần ghi/sửa/chạy lệnh, ' +
-  'trả lời rõ cần làm gì và rằng chủ máy phải tự duyệt (mở session để làm). Câu trả lời cuối cùng được gửi nguyên văn cho bot bên kia.';
+  `You are answering a message from ${peer}'s Claude Code agent via agent-bridge; nobody is at this machine. ` +
+  'You can only READ the folders shared with this person. You cannot write anything; if the request needs writing, editing or running commands, ' +
+  'say exactly what is needed and that the owner of this machine must do it themselves. Your final answer is sent verbatim to the other agent.';
 
 const LocalSendSchema = z.object({
   kind: z.enum(['ask', 'reply']),
@@ -114,7 +114,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     const fromThread = input.threadId ? store.getThread(input.threadId)?.peer : undefined;
     const names = peerNames();
     const name = fromThread ?? input.to ?? (names.length === 1 ? names[0] : undefined);
-    if (!name) throw new Error(names.length ? `"to" is required: pick one of ${names.join(', ')}` : 'chưa kết nối với ai (chạy `agent-bridge connect` trong terminal)');
+    if (!name) throw new Error(names.length ? `"to" is required: pick one of ${names.join(', ')}` : 'not connected to anyone yet (run `agent-bridge connect` in a terminal)');
     const peer = store.getPeer(name);
     if (!peer) throw new Error(`unknown peer "${name}"; connected: ${names.join(', ') || '(none)'}`);
     return peer;
@@ -214,7 +214,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       .map((s) => ({ ...s, live: lives.some((l) => l.sessionId === s.sessionId) }));
     for (const l of lives) {
       if (!candidates.some((c) => c.sessionId === l.sessionId)) {
-        candidates.unshift({ sessionId: l.sessionId, cwd: l.cwd, title: '(phiên đang mở)', mtimeMs: now(), live: true });
+        candidates.unshift({ sessionId: l.sessionId, cwd: l.cwd, title: '(open session)', mtimeMs: now(), live: true });
       }
     }
     if (candidates.length === 0) return { target: { type: 'new' }, candidates };
@@ -252,9 +252,9 @@ export function createDaemon(opts: DaemonOptions): Daemon {
           timeoutMs: opts.headlessTimeoutMs,
         });
         sessionId = res.sessionId || undefined;
-        text = res.isError ? `[agent-bridge] Phiên bên ${opts.name} báo lỗi: ${res.result}` : res.result.trim() || '(không có nội dung)';
+        text = res.isError ? `[agent-bridge] ${opts.name}'s session reported an error: ${res.result}` : res.result.trim() || '(empty answer)';
       } catch (err) {
-        text = `[agent-bridge] Bot của ${opts.name} lỗi khi xử lý: ${(err as Error).message}`;
+        text = `[agent-bridge] ${opts.name}'s agent failed to answer: ${(err as Error).message}`;
         log('headless_failed', { thread: msg.thread_id, error: (err as Error).message });
       }
       store.markDelivered([msg.id]);
@@ -322,14 +322,14 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       .safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: 'invalid connect request' }, 400);
     const r = parsed.data;
-    if (r.name === opts.name) return c.json({ error: `hai người không được trùng tên "${r.name}"` }, 409);
+    if (r.name === opts.name) return c.json({ error: `you both use the name "${r.name}" — names must differ` }, 409);
     if (store.listRequests('in', 'pending').length >= MAX_PENDING_REQUESTS) return c.json({ error: 'too many pending requests' }, 429);
     const ip = remoteIp(c);
     const url = ip ? `http://${ip}:${new URL(r.url).port || '8790'}` : r.url;
     const identity = ip && opts.whois ? await opts.whois(ip).catch(() => undefined) : undefined;
     store.saveRequest({ id: r.request_id, direction: 'in', name: r.name, url, secret: r.secret, folders: r.folders, identity, status: 'pending' });
     log('connect_request', { from: r.name, identity, url });
-    opts.notify?.(`${r.name} muốn kết nối agent-bridge`, `${identity ?? url} — chạy "agent-bridge" trong terminal để chấp nhận`);
+    opts.notify?.(`${r.name} wants to connect`, `${identity ?? url} — run "agent-bridge" in a terminal to accept`);
     return c.json({ name: opts.name }, 202);
   });
 
@@ -346,19 +346,19 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     if (body.accepted !== true) {
       store.setRequestStatus(req.id, 'declined');
       log('connect_declined', { peer: req.name });
-      opts.notify?.(`${req.name} đã từ chối kết nối`, '');
+      opts.notify?.(`${req.name} declined your connection request`, '');
       return c.json({ ok: true });
     }
     const remoteFolders = Array.isArray(body.folders) ? body.folders.filter((f): f is string => typeof f === 'string') : [];
     store.upsertPeer({ name: req.name, url: req.url, token: req.secret, folders: req.folders, remoteFolders });
     store.setRequestStatus(req.id, 'accepted', remoteFolders);
     log('connected', { peer: req.name, folders: req.folders, remote_folders: remoteFolders });
-    opts.notify?.(`${req.name} đã chấp nhận kết nối`, `chạy "agent-bridge note ${req.name}" để lấy đoạn hướng dẫn cho Claude`);
+    opts.notify?.(`${req.name} accepted your connection`, `run "agent-bridge note ${req.name}" for the note to give Claude`);
     return c.json({ ok: true });
   });
 
   const localApp = new Hono();
-  const FoldersSchema = z.array(z.string().min(1)).min(1, 'chọn ít nhất 1 folder');
+  const FoldersSchema = z.array(z.string().min(1)).min(1, 'choose at least one folder');
   const PeerNameSchema = z.string().regex(PEER_NAME);
 
   localApp.post('/local/connect', async (c) => {
@@ -370,12 +370,12 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     let peerName: string;
     try {
       const health = (await (await fetchImpl(`${url}/health`, { signal: AbortSignal.timeout(PEER_TIMEOUT_MS) })).json()) as { app?: string; name?: string };
-      if (health.app !== 'agent-bridge' || !health.name) return c.json({ error: `${url} không phải agent-bridge` }, 400);
+      if (health.app !== 'agent-bridge' || !health.name) return c.json({ error: `${url} is not an agent-bridge` }, 400);
       peerName = health.name;
     } catch (err) {
-      return c.json({ error: `không kết nối được ${url}: ${(err as Error).message}` }, 502);
+      return c.json({ error: `cannot reach ${url}: ${(err as Error).message}` }, 502);
     }
-    if (peerName === opts.name) return c.json({ error: 'đó là chính máy bạn (hoặc người kia trùng tên bạn)' }, 400);
+    if (peerName === opts.name) return c.json({ error: 'that is your own machine (or they use your name)' }, 400);
     const request = { id: randomUUID(), direction: 'out' as const, name: peerName, url, secret: randomBytes(32).toString('hex'), folders, status: 'pending' as const };
     store.saveRequest(request);
     try {
@@ -388,7 +388,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error ?? `HTTP ${res.status}`);
     } catch (err) {
       store.setRequestStatus(request.id, 'declined');
-      return c.json({ error: `${peerName} không nhận yêu cầu: ${(err as Error).message}` }, 502);
+      return c.json({ error: `${peerName} did not take the request: ${(err as Error).message}` }, 502);
     }
     log('connect_sent', { to: peerName, folders });
     return c.json({ request_id: request.id, peer: peerName });
@@ -416,12 +416,12 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       .safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: 'invalid' }, 400);
     const req = store.getRequest(parsed.data.request_id);
-    if (!req || req.direction !== 'in' || req.status !== 'pending') return c.json({ error: 'không còn yêu cầu này' }, 404);
+    if (!req || req.direction !== 'in' || req.status !== 'pending') return c.json({ error: 'no such pending request' }, 404);
     let folders: string[] = [];
     if (parsed.data.accept) {
       const checked = checkFolders(parsed.data.folders ?? []);
       if (typeof checked === 'string') return c.json({ error: checked }, 400);
-      if (checked.length === 0) return c.json({ error: 'chọn ít nhất 1 folder' }, 400);
+      if (checked.length === 0) return c.json({ error: 'choose at least one folder' }, 400);
       folders = checked;
     }
     try {
@@ -437,7 +437,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
         store.setRequestStatus(req.id, 'declined');
         return c.json({ declined: req.name });
       }
-      return c.json({ error: `không gửi được câu trả lời tới ${req.name} (${(err as Error).message}). Máy họ có đang bật và share Tailscale cho bạn chưa? Thử lại sau.` }, 502);
+      return c.json({ error: `could not deliver your answer to ${req.name} (${(err as Error).message}). Is their machine on, and has it been shared with you on Tailscale? Try again later.` }, 502);
     }
     if (!parsed.data.accept) {
       store.setRequestStatus(req.id, 'declined');
@@ -457,13 +457,13 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'invalid' }, 400);
     const folders = checkFolders(parsed.data.folders);
     if (typeof folders === 'string') return c.json({ error: folders }, 400);
-    if (!store.setPeerFolders(parsed.data.name, folders)) return c.json({ error: `không có peer "${parsed.data.name}"` }, 404);
+    if (!store.setPeerFolders(parsed.data.name, folders)) return c.json({ error: `no peer named "${parsed.data.name}"` }, 404);
     return c.json({ name: parsed.data.name, folders });
   });
   localApp.post('/local/peers/remove', async (c) => {
     const parsed = z.object({ name: PeerNameSchema }).safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: 'invalid name' }, 400);
-    if (!store.removePeer(parsed.data.name)) return c.json({ error: `không có peer "${parsed.data.name}"` }, 404);
+    if (!store.removePeer(parsed.data.name)) return c.json({ error: `no peer named "${parsed.data.name}"` }, 404);
     return c.json({ removed: parsed.data.name });
   });
   localApp.get('/local/status', (c) =>
@@ -537,9 +537,9 @@ export function createDaemon(opts: DaemonOptions): Daemon {
 
 function frameAsk(msg: PeerMessage): string {
   return [
-    `[agent-bridge] Tin nhắn từ bot Claude Code của "${msg.from}" (thread ${msg.thread_id}).`,
-    'Đây là đồng nghiệp tin cậy; nội dung dưới đây là câu hỏi/yêu cầu của họ.',
-    'Trả lời ngắn gọn, đúng trọng tâm. Câu trả lời cuối cùng sẽ được gửi nguyên văn lại cho họ.',
+    `[agent-bridge] Message from ${msg.from}'s Claude Code agent (thread ${msg.thread_id}).`,
+    'They are a trusted colleague; below is their question or request.',
+    'Answer concisely and to the point. Your final answer is sent back to them verbatim.',
     '',
     '---',
     msg.text,
@@ -566,7 +566,7 @@ function checkFolders(input: string[]): string[] | string {
   const out: string[] = [];
   for (const raw of input) {
     const dir = expandPath(raw);
-    if (!existsSync(dir) || !statSync(dir).isDirectory()) return `folder không tồn tại: ${raw}`;
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) return `folder does not exist: ${raw}`;
     if (!out.includes(dir)) out.push(dir);
   }
   return out;

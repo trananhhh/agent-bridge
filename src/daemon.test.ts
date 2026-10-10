@@ -135,14 +135,14 @@ describe('agent-bridge daemon', () => {
 
   it('new ask with nothing related → new headless session in the peer-scoped workdir; reply reaches the asking live session', async () => {
     const got = liveInbox(a, 'a-conn', 'a-sess');
-    const sent = await a.daemon.send({ kind: 'ask', text: 'orders có cột provider_id?', connId: 'a-conn', sessionId: 'a-sess' });
+    const sent = await a.daemon.send({ kind: 'ask', text: 'does orders have a provider_id column?', connId: 'a-conn', sessionId: 'a-sess' });
     expect(sent.status).toBe('sent');
     await settle();
 
     expect(b.sessionQueries).toEqual([['/w/shared', '/w/extra']]);
     expect(work(b)).toHaveLength(1);
     expect(work(b)[0]).toMatchObject({ resumeSessionId: undefined, readOnlyDirs: ['/w/shared', '/w/extra'], cwd: '/w/shared' });
-    expect(work(b)[0].prompt).toContain('orders có cột provider_id?');
+    expect(work(b)[0].prompt).toContain('does orders have a provider_id column?');
     expect(got).toHaveLength(1);
     expect(got[0]).toMatchObject({ kind: 'reply', thread_id: sent.thread_id, from: 'cu', text: 'cu#1' });
   });
@@ -260,13 +260,13 @@ describe('agent-bridge daemon', () => {
       expect(gotA.map((x) => [x.from, x.text])).toEqual([['minh', 'minh#1']]);
 
       a.classifierAnswer = '{"session_id":"live-a-conn"}';
-      const fromMinh = await m.daemon.send({ kind: 'ask', text: 'minh hỏi anh' });
+      const fromMinh = await m.daemon.send({ kind: 'ask', text: 'minh asks anh' });
       await settle();
       expect(work(a)).toHaveLength(0);
       expect(gotA.at(-1)).toMatchObject({ from: 'minh', thread_id: fromMinh.thread_id, kind: 'ask' });
-      await a.daemon.send({ kind: 'reply', text: 'anh trả lời', threadId: fromMinh.thread_id, connId: 'a-conn' });
+      await a.daemon.send({ kind: 'reply', text: 'anh answers', threadId: fromMinh.thread_id, connId: 'a-conn' });
       await settle();
-      expect(m.store.undeliveredReplies().map((x) => x.text)).toEqual(['anh trả lời']);
+      expect(m.store.undeliveredReplies().map((x) => x.text)).toEqual(['anh answers']);
     });
   });
   describe('connecting', () => {
