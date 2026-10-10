@@ -1,28 +1,26 @@
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { existsSync, statSync } from 'node:fs';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import type { ClaudeRunner } from './claude-runner.ts';
+import { expandPath } from './config.ts';
+import { decodeInvite, encodeInvite } from './invite.ts';
 import { PeerMessageSchema, type MessageKind, type PeerMessage } from './protocol.ts';
 import { buildClassifierPrompt, parseClassifierOutput, resolveTarget, routeInbound, type ClassifierCandidate, type Target } from './router.ts';
 import { isWithin, type SessionCandidate } from './sessions.ts';
-import type { BridgeStore } from './store.ts';
+import type { BridgeStore, PeerRecord } from './store.ts';
 
-export interface DaemonPeer {
-  name: string;
-  url: string;
-  token: string;
-  /** Directories this peer's questions may be answered from. First entry hosts brand-new sessions. */
-  workdirs: string[];
-}
+/** Peer `folders`: the only directories this peer's questions may be answered from (read-only). First one hosts new sessions. */
+type DaemonPeer = PeerRecord;
 
 export interface DaemonOptions {
   name: string;
-  peers: DaemonPeer[];
+  /** How peers reach this daemon (http://<tailscale-ip>:<port>); embedded in invite codes. */
+  publicUrl: string;
   store: BridgeStore;
   runner: ClaudeRunner;
   listSessions: (allowedDirs: string[]) => SessionCandidate[];
-  headlessAllowedTools: string[];
   headlessTimeoutMs: number;
   activeWindowMs: number;
   classifierModel?: string;
@@ -35,7 +33,7 @@ export interface LiveConn {
   connId: string;
   sessionId?: string;
   cwd?: string;
-  push: (msg: PeerMessage) => boolean;
+  push: (msg: PeerMessage, ctx: { folders?: string[] }) => boolean;
 }
 
 export interface SendInput {
@@ -65,12 +63,14 @@ export interface Daemon {
 }
 
 const PEER_TIMEOUT_MS = 10_000;
+const INVITE_TTL_MS = 24 * 3600_000;
+const PEER_NAME = /^[a-z0-9_-]{1,50}$/;
 const CLASSIFIER_TIMEOUT_MS = 120_000;
 
 const headlessSystemPrompt = (peer: string) =>
   `Bạn đang trả lời tin nhắn từ bot Claude Code của "${peer}" qua agent-bridge; không có người ngồi trước màn hình. ` +
-  'Chỉ đọc/tra cứu để trả lời; không sửa file, không ghi DB, không deploy, không gửi tin ra ngoài. ' +
-  'Nếu cần hành động ghi, nói rõ cần chủ máy duyệt. Câu trả lời cuối cùng được gửi nguyên văn cho bot bên kia.';
+  'Bạn chỉ có quyền ĐỌC trong các thư mục được chia sẻ với người này. Không ghi được gì; nếu yêu cầu cần ghi/sửa/chạy lệnh, ' +
+  'trả lời rõ cần làm gì và rằng chủ máy phải tự duyệt (mở session để làm). Câu trả lời cuối cùng được gửi nguyên văn cho bot bên kia.';
 
 const LocalSendSchema = z.object({
   kind: z.enum(['ask', 'reply']),
@@ -87,7 +87,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
   const log = opts.log ?? ((event, data) => console.error(JSON.stringify({ t: new Date().toISOString(), event, ...data })));
   const fetchImpl = opts.fetchImpl ?? ((url, init) => fetch(url, init));
   const { store } = opts;
-  const peers = new Map(opts.peers.map((p) => [p.name, p]));
+  const peerNames = () => store.listPeers().map((p) => p.name);
   const live = new Map<string, LiveConn>();
   const pending = new Set<Promise<unknown>>();
   const queues = new Map<string, Promise<unknown>>();
@@ -107,10 +107,11 @@ export function createDaemon(opts: DaemonOptions): Daemon {
 
   function resolvePeer(input: SendInput): DaemonPeer {
     const fromThread = input.threadId ? store.getThread(input.threadId)?.peer : undefined;
-    const name = fromThread ?? input.to ?? (peers.size === 1 ? [...peers.keys()][0] : undefined);
-    if (!name) throw new Error(`"to" is required: pick one of ${[...peers.keys()].join(', ') || '(no peers configured)'}`);
-    const peer = peers.get(name);
-    if (!peer) throw new Error(`unknown peer "${name}"; configured: ${[...peers.keys()].join(', ') || '(none)'}`);
+    const names = peerNames();
+    const name = fromThread ?? input.to ?? (names.length === 1 ? names[0] : undefined);
+    if (!name) throw new Error(names.length ? `"to" is required: pick one of ${names.join(', ')}` : 'chưa kết nối với ai (tạo mã mời bằng create_invite)');
+    const peer = store.getPeer(name);
+    if (!peer) throw new Error(`unknown peer "${name}"; connected: ${names.join(', ') || '(none)'}`);
     return peer;
   }
 
@@ -158,7 +159,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     const unreachable = new Set<string>();
     for (const entry of store.outbox()) {
       if (unreachable.has(entry.peer)) continue; // keep per-peer ordering
-      const peer = peers.get(entry.peer);
+      const peer = store.getPeer(entry.peer);
       if (!peer) {
         store.removeOutbox(entry.message.id);
         log('outbox_dropped', { id: entry.message.id, reason: `peer ${entry.peer} no longer configured` });
@@ -180,7 +181,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     if (!conn) return false;
     let ok = false;
     try {
-      ok = conn.push(msg);
+      ok = conn.push(msg, { folders: msg.kind === 'ask' ? store.getPeer(msg.from)?.folders : undefined });
     } catch {
       ok = false;
     }
@@ -200,11 +201,11 @@ export function createDaemon(opts: DaemonOptions): Daemon {
 
   async function classify(msg: PeerMessage, peer: DaemonPeer): Promise<{ target: Target; candidates: ClassifierCandidate[] }> {
     const lives = [...live.values()]
-      .filter((c) => isWithin(c.cwd, peer.workdirs))
+      .filter((c) => isWithin(c.cwd, peer.folders))
       .map((c) => ({ connId: c.connId, sessionId: c.sessionId ?? `live-${c.connId}`, cwd: c.cwd }));
     const candidates: ClassifierCandidate[] = opts
-      .listSessions(peer.workdirs)
-      .filter((s) => isWithin(s.cwd, peer.workdirs))
+      .listSessions(peer.folders)
+      .filter((s) => isWithin(s.cwd, peer.folders))
       .map((s) => ({ ...s, live: lives.some((l) => l.sessionId === s.sessionId) }));
     for (const l of lives) {
       if (!candidates.some((c) => c.sessionId === l.sessionId)) {
@@ -216,7 +217,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     try {
       const res = await opts.runner({
         prompt: buildClassifierPrompt(msg.text, candidates),
-        cwd: peer.workdirs[0],
+        cwd: peer.folders[0],
         noTools: true,
         model: opts.classifierModel,
         timeoutMs: CLASSIFIER_TIMEOUT_MS,
@@ -230,7 +231,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
   }
 
   async function runHeadless(msg: PeerMessage, peer: DaemonPeer, resume?: { sessionId: string; cwd?: string; fork?: boolean }): Promise<void> {
-    const cwd = resume?.cwd && isWithin(resume.cwd, peer.workdirs) ? resume.cwd : peer.workdirs[0];
+    const cwd = resume?.cwd && isWithin(resume.cwd, peer.folders) ? resume.cwd : peer.folders[0];
     await serialize(resume?.sessionId ?? msg.thread_id, async () => {
       let text: string;
       let sessionId: string | undefined;
@@ -241,7 +242,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
           cwd,
           resumeSessionId: resume?.sessionId,
           fork: resume?.fork,
-          allowedTools: opts.headlessAllowedTools,
+          readOnlyDirs: peer.folders,
           appendSystemPrompt: headlessSystemPrompt(peer.name),
           timeoutMs: opts.headlessTimeoutMs,
         });
@@ -293,7 +294,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
   const peerApp = new Hono();
   peerApp.get('/health', (c) => c.json({ ok: true, name: opts.name }));
   peerApp.post('/inbox', async (c) => {
-    const peer = peerForToken(c.req.header('authorization'), opts.peers);
+    const peer = peerForToken(c.req.header('authorization'), store.listPeers());
     if (!peer) return c.json({ error: 'unauthorized' }, 401);
     const parsed = PeerMessageSchema.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: 'invalid message' }, 400);
@@ -303,9 +304,87 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     return c.json({ accepted: true }, 202);
   });
 
+  peerApp.post('/pair', async (c) => {
+    const body = (await c.req.json().catch(() => null)) as { secret?: unknown; name?: unknown; url?: unknown } | null;
+    const secret = typeof body?.secret === 'string' ? body.secret : '';
+    const name = typeof body?.name === 'string' ? body.name : '';
+    const url = typeof body?.url === 'string' ? body.url : '';
+    if (!secret || !PEER_NAME.test(name) || !URL.canParse(url)) return c.json({ error: 'invalid pairing request' }, 400);
+    if (name === opts.name) return c.json({ error: `bên kia cũng tên "${name}" — hai người phải khác tên` }, 409);
+    const taken = store.takeInvite(hashSecret(secret), now());
+    if (!taken.ok) {
+      const reason = { unknown: 'mã mời không tồn tại (bên mời có thể đã cài lại)', used: 'mã mời đã được dùng', expired: 'mã mời đã hết hạn (24h)' }[taken.reason];
+      return c.json({ error: reason }, 410);
+    }
+    store.upsertPeer({ name, url, token: secret, folders: taken.folders });
+    log('paired', { peer: name, url, folders: taken.folders });
+    return c.json({ name: opts.name });
+  });
+
   const localApp = new Hono();
+  const FoldersSchema = z.array(z.string().min(1)).min(1, 'chọn ít nhất 1 folder');
+  const PeerNameSchema = z.string().regex(PEER_NAME);
+
+  localApp.post('/local/invite', async (c) => {
+    const parsed = z.object({ folders: FoldersSchema }).safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'invalid' }, 400);
+    const folders = checkFolders(parsed.data.folders);
+    if (typeof folders === 'string') return c.json({ error: folders }, 400);
+    const secret = randomBytes(32).toString('hex');
+    const expiresAt = now() + INVITE_TTL_MS;
+    store.createInvite(hashSecret(secret), folders, expiresAt);
+    log('invite_created', { folders });
+    return c.json({ code: encodeInvite({ name: opts.name, url: opts.publicUrl, secret }), folders, expires_at: new Date(expiresAt).toISOString() });
+  });
+
+  localApp.post('/local/accept', async (c) => {
+    const parsed = z.object({ code: z.string().min(1), folders: FoldersSchema }).safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'invalid' }, 400);
+    const folders = checkFolders(parsed.data.folders);
+    if (typeof folders === 'string') return c.json({ error: folders }, 400);
+    let invite;
+    try {
+      invite = decodeInvite(parsed.data.code);
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    if (invite.name === opts.name) return c.json({ error: 'đây là mã mời do chính bạn tạo — gửi nó cho người kia' }, 400);
+    let res: Response;
+    try {
+      res = await fetchImpl(`${invite.url.replace(/\/$/, '')}/pair`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ secret: invite.secret, name: opts.name, url: opts.publicUrl }),
+        signal: AbortSignal.timeout(PEER_TIMEOUT_MS),
+      });
+    } catch (err) {
+      return c.json({ error: `không kết nối được tới ${invite.name} (${invite.url}): ${(err as Error).message}. Kiểm tra Tailscale (hai máy thấy nhau chưa) và daemon bên kia.` }, 502);
+    }
+    const body = (await res.json().catch(() => ({}))) as { name?: string; error?: string };
+    if (!res.ok) return c.json({ error: body.error ?? `${invite.name} từ chối (${res.status})` }, 400);
+    if (body.name !== invite.name) return c.json({ error: `máy ở ${invite.url} tự nhận là "${body.name}", không phải "${invite.name}"` }, 400);
+    store.upsertPeer({ name: invite.name, url: invite.url, token: invite.secret, folders });
+    log('paired', { peer: invite.name, url: invite.url, folders });
+    return c.json({ peer: invite.name, folders });
+  });
+
+  localApp.get('/local/peers', (c) => c.json({ peers: store.listPeers().map(({ token: _t, ...p }) => p) }));
+  localApp.post('/local/peers/folders', async (c) => {
+    const parsed = z.object({ name: PeerNameSchema, folders: FoldersSchema }).safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'invalid' }, 400);
+    const folders = checkFolders(parsed.data.folders);
+    if (typeof folders === 'string') return c.json({ error: folders }, 400);
+    if (!store.setPeerFolders(parsed.data.name, folders)) return c.json({ error: `không có peer "${parsed.data.name}"` }, 404);
+    return c.json({ name: parsed.data.name, folders });
+  });
+  localApp.post('/local/peers/remove', async (c) => {
+    const parsed = z.object({ name: PeerNameSchema }).safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: 'invalid name' }, 400);
+    if (!store.removePeer(parsed.data.name)) return c.json({ error: `không có peer "${parsed.data.name}"` }, 404);
+    return c.json({ removed: parsed.data.name });
+  });
   localApp.get('/local/status', (c) =>
-    c.json({ name: opts.name, peers: opts.peers.map((p) => ({ name: p.name, url: p.url })), live: live.size, outbox: store.outbox().length }),
+    c.json({ name: opts.name, url: opts.publicUrl, peers: store.listPeers().map((p) => ({ name: p.name, url: p.url })), live: live.size, outbox: store.outbox().length }),
   );
   localApp.get('/local/stream', (c) => {
     const connId = c.req.query('conn') || randomUUID();
@@ -318,9 +397,9 @@ export function createDaemon(opts: DaemonOptions): Daemon {
         connId,
         sessionId,
         cwd,
-        push: (m) => {
+        push: (m, ctx) => {
           if (stream.aborted || stream.closed) return false;
-          queue.push(m);
+          queue.push({ ...m, ...ctx } as PeerMessage);
           wake?.();
           return true;
         },
@@ -382,6 +461,21 @@ function frameAsk(msg: PeerMessage): string {
     '---',
     msg.text,
   ].join('\n');
+}
+
+function hashSecret(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex');
+}
+
+/** Normalizes folder choices; returns an error message when one isn't an existing directory. */
+function checkFolders(input: string[]): string[] | string {
+  const out: string[] = [];
+  for (const raw of input) {
+    const dir = expandPath(raw);
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) return `folder không tồn tại: ${raw}`;
+    if (!out.includes(dir)) out.push(dir);
+  }
+  return out;
 }
 
 function peerForToken(header: string | undefined, peers: DaemonPeer[]): DaemonPeer | undefined {

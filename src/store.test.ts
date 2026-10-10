@@ -47,20 +47,42 @@ describe('BridgeStore', () => {
     store.insertMessage(msg({ id: 'r1', thread_id: 'ta', kind: 'reply' }), 'in');
     store.insertMessage(msg({ id: 'r2', thread_id: 'tb', kind: 'reply' }), 'in');
     store.insertMessage(msg({ id: 'a1', thread_id: 'ta', kind: 'ask' }), 'in');
-
     expect(store.undeliveredReplies('sa').map((m) => m.id)).toEqual(['r1']);
     expect(store.undeliveredReplies().map((m) => m.id).sort()).toEqual(['r1', 'r2']);
     store.markDelivered(['r1']);
     expect(store.undeliveredReplies().map((m) => m.id)).toEqual(['r2']);
   });
 
-  it('tracks outbox retries', () => {
-    const m = msg({ id: 'o1' });
-    store.enqueueOutbox(m, 'cu', 'ECONNREFUSED');
+  it('tracks outbox retries per peer', () => {
+    store.enqueueOutbox(msg({ id: 'o1' }), 'cu', 'ECONNREFUSED');
     expect(store.outbox().map((o) => [o.message.id, o.peer])).toEqual([['o1', 'cu']]);
     store.bumpOutbox('o1', 'timeout');
     expect(store.outbox()[0]).toMatchObject({ attempts: 2, last_error: 'timeout' });
     store.removeOutbox('o1');
     expect(store.outbox()).toEqual([]);
+  });
+
+  it('stores peers with their folders and replaces on re-pair', () => {
+    store.upsertPeer({ name: 'cu', url: 'http://a:8790', token: 't1', folders: ['/w/a'] });
+    store.upsertPeer({ name: 'minh', url: 'http://b:8790', token: 't2', folders: ['/w/b', '/w/c'] });
+    store.upsertPeer({ name: 'cu', url: 'http://a2:8790', token: 't3', folders: ['/w/a'] });
+    expect(store.listPeers()).toEqual([
+      { name: 'cu', url: 'http://a2:8790', token: 't3', folders: ['/w/a'] },
+      { name: 'minh', url: 'http://b:8790', token: 't2', folders: ['/w/b', '/w/c'] },
+    ]);
+    expect(store.setPeerFolders('minh', ['/w/z'])).toBe(true);
+    expect(store.getPeer('minh')?.folders).toEqual(['/w/z']);
+    expect(store.removePeer('cu')).toBe(true);
+    expect(store.removePeer('cu')).toBe(false);
+    expect(store.listPeers().map((p) => p.name)).toEqual(['minh']);
+  });
+
+  it('consumes an invite exactly once and refuses expired ones', () => {
+    store.createInvite('h1', ['/w/a'], 1_000);
+    store.createInvite('h2', ['/w/b'], 1_000);
+    expect(store.takeInvite('h1', 500)).toEqual({ ok: true, folders: ['/w/a'] });
+    expect(store.takeInvite('h1', 500)).toEqual({ ok: false, reason: 'used' });
+    expect(store.takeInvite('h2', 2_000)).toEqual({ ok: false, reason: 'expired' });
+    expect(store.takeInvite('nope', 500)).toEqual({ ok: false, reason: 'unknown' });
   });
 });

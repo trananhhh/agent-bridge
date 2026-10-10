@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createDaemon, type Daemon, type DaemonPeer } from './daemon.ts';
+import { createDaemon, type Daemon } from './daemon.ts';
 import { BridgeStore } from './store.ts';
 import type { ClaudeRunOptions, ClaudeRunner } from './claude-runner.ts';
 import type { PeerMessage } from './protocol.ts';
@@ -38,7 +38,7 @@ describe('agent-bridge daemon', () => {
     };
   }
 
-  function addSide(name: string, peers: { name: string; workdirs?: string[] }[]): Side {
+  function addSide(name: string, peers: { name: string; folders?: string[] }[]): Side {
     const side = {
       name,
       store: new BridgeStore(join(dir, `${name}.db`)),
@@ -48,22 +48,18 @@ describe('agent-bridge daemon', () => {
       classifierAnswer: '{"session_id":null}',
       down: false,
     } as unknown as Side;
-    const daemonPeers: DaemonPeer[] = peers.map((p) => ({
-      name: p.name,
-      url: `http://${p.name}.test`,
-      token: pairToken(name, p.name),
-      workdirs: p.workdirs ?? ['/w/shared'],
-    }));
+    for (const p of peers) {
+      side.store.upsertPeer({ name: p.name, url: `http://${p.name}.test`, token: pairToken(name, p.name), folders: p.folders ?? ['/w/shared'] });
+    }
     side.daemon = createDaemon({
       name,
-      peers: daemonPeers,
+      publicUrl: `http://${name}.test`,
       store: side.store,
       runner: makeRunner(side),
       listSessions: (allowedDirs) => {
         side.sessionQueries.push(allowedDirs);
         return side.sessions;
       },
-      headlessAllowedTools: ['Read'],
       headlessTimeoutMs: 1000,
       activeWindowMs: 10 * 60_000,
       now: () => NOW,
@@ -86,7 +82,7 @@ describe('agent-bridge daemon', () => {
     dir = mkdtempSync(join(tmpdir(), 'bridge-daemon-'));
     net.clear();
     a = addSide('anh', [{ name: 'cu' }]);
-    b = addSide('cu', [{ name: 'anh', workdirs: ['/w/shared', '/w/extra'] }]);
+    b = addSide('cu', [{ name: 'anh', folders: ['/w/shared', '/w/extra'] }]);
   });
   afterEach(() => {
     for (const s of net.values()) s.store.close();
@@ -97,8 +93,8 @@ describe('agent-bridge daemon', () => {
     for (let i = 0; i < 3; i++) for (const s of net.values()) await s.daemon.idle();
   };
   const liveInbox = (side: Side, connId: string, sessionId?: string, cwd = '/w/shared') => {
-    const got: PeerMessage[] = [];
-    side.daemon.registerLive({ connId, sessionId, cwd, push: (m) => (got.push(m), true) });
+    const got: (PeerMessage & { folders?: string[] })[] = [];
+    side.daemon.registerLive({ connId, sessionId, cwd, push: (m, ctx) => (got.push({ ...m, ...ctx }), true) });
     return got;
   };
   const work = (s: Side) => s.calls.filter((c) => !c.noTools);
@@ -136,7 +132,7 @@ describe('agent-bridge daemon', () => {
 
     expect(b.sessionQueries).toEqual([['/w/shared', '/w/extra']]);
     expect(work(b)).toHaveLength(1);
-    expect(work(b)[0]).toMatchObject({ resumeSessionId: undefined, allowedTools: ['Read'], cwd: '/w/shared' });
+    expect(work(b)[0]).toMatchObject({ resumeSessionId: undefined, readOnlyDirs: ['/w/shared', '/w/extra'], cwd: '/w/shared' });
     expect(work(b)[0].prompt).toContain('orders có cột provider_id?');
     expect(got).toHaveLength(1);
     expect(got[0]).toMatchObject({ kind: 'reply', thread_id: sent.thread_id, from: 'cu', text: 'cu#1' });
@@ -165,6 +161,7 @@ describe('agent-bridge daemon', () => {
     const sent = await a.daemon.send({ kind: 'ask', text: 'schema?', connId: 'a-conn' });
     await settle();
     expect(gotB).toHaveLength(1);
+    expect(gotB[0].folders).toEqual(['/w/shared', '/w/extra']);
     expect(work(b)).toHaveLength(0);
 
     await b.daemon.send({ kind: 'reply', text: 'yes it does', threadId: sent.thread_id, connId: 'b-conn' });
@@ -172,7 +169,7 @@ describe('agent-bridge daemon', () => {
     expect(gotA.map((m) => m.text)).toEqual(['yes it does']);
   });
 
-  it('never offers a live session outside the asking peer workdirs', async () => {
+  it('never offers a live session outside the folders shared with the asking peer', async () => {
     liveInbox(a, 'a-conn');
     const gotB = liveInbox(b, 'b-conn', 'b-private', '/w/private');
     b.classifierAnswer = '{"session_id":"b-private"}';
@@ -240,7 +237,7 @@ describe('agent-bridge daemon', () => {
       m = addSide('minh', [{ name: 'anh' }]);
     });
 
-    it('requires `to` when more than one peer is configured, and rejects unknown peers', async () => {
+    it('requires `to` when more than one peer is connected, and rejects unknown peers', async () => {
       await expect(a.daemon.send({ kind: 'ask', text: 'q' })).rejects.toThrow(/to/);
       await expect(a.daemon.send({ kind: 'ask', text: 'q', to: 'ghost' })).rejects.toThrow(/ghost/);
     });
@@ -261,6 +258,71 @@ describe('agent-bridge daemon', () => {
       await a.daemon.send({ kind: 'reply', text: 'anh trả lời', threadId: fromMinh.thread_id, connId: 'a-conn' });
       await settle();
       expect(m.store.undeliveredReplies().map((x) => x.text)).toEqual(['anh trả lời']);
+    });
+  });
+  describe('pairing', () => {
+    let fa: string;
+    let fb: string;
+    const local = async (side: Side, path: string, body: unknown) => {
+      const res = await side.daemon.localApp.request(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    };
+
+    beforeEach(() => {
+      for (const s of net.values()) s.store.close();
+      net.clear();
+      fa = realpathSync(mkdtempSync(join(dir, 'fa-')));
+      fb = realpathSync(mkdtempSync(join(dir, 'fb-')));
+      mkdirSync(join(fb, 'sub'));
+      a = addSide('anh', []);
+      b = addSide('cu', []);
+    });
+
+    it('invite + accept connects both sides, each with the folders its own user chose', async () => {
+      const inv = await local(a, '/local/invite', { folders: [fa] });
+      expect(inv.status).toBe(200);
+      const acc = await local(b, '/local/accept', { code: inv.body.code, folders: [fb, join(fb, 'sub/')] });
+      expect(acc).toMatchObject({ status: 200, body: { peer: 'anh' } });
+
+      expect(a.store.getPeer('cu')).toMatchObject({ url: 'http://cu.test', folders: [fa] });
+      expect(b.store.getPeer('anh')).toMatchObject({ url: 'http://anh.test', folders: [fb, join(fb, 'sub')] });
+      expect(a.store.getPeer('cu')!.token).toBe(b.store.getPeer('anh')!.token);
+
+      const got = liveInbox(a, 'a-conn', undefined, fa);
+      await a.daemon.send({ kind: 'ask', text: 'hello', connId: 'a-conn' });
+      await settle();
+      expect(work(b)[0]).toMatchObject({ cwd: fb, readOnlyDirs: [fb, join(fb, 'sub')] });
+      expect(got.map((m) => m.text)).toEqual(['cu#1']);
+    });
+
+    it('an invite code works once', async () => {
+      const inv = await local(a, '/local/invite', { folders: [fa] });
+      await local(b, '/local/accept', { code: inv.body.code, folders: [fb] });
+      const again = await local(b, '/local/accept', { code: inv.body.code, folders: [fb] });
+      expect(again.status).toBe(400);
+      expect(String(again.body.error)).toMatch(/đã được dùng/);
+    });
+
+    it('refuses folders that do not exist and codes created by yourself', async () => {
+      expect((await local(a, '/local/invite', { folders: [join(fa, 'missing')] })).status).toBe(400);
+      expect((await local(a, '/local/invite', { folders: [] })).status).toBe(400);
+      const inv = await local(a, '/local/invite', { folders: [fa] });
+      expect((await local(a, '/local/accept', { code: inv.body.code, folders: [fa] })).status).toBe(400);
+    });
+
+    it('lists, re-scopes and removes peers', async () => {
+      const inv = await local(a, '/local/invite', { folders: [fa] });
+      await local(b, '/local/accept', { code: inv.body.code, folders: [fb] });
+      const list = await a.daemon.localApp.request('/local/peers');
+      expect(await list.json()).toEqual({ peers: [{ name: 'cu', url: 'http://cu.test', folders: [fa] }] });
+      expect((await local(a, '/local/peers/folders', { name: 'cu', folders: [fb] })).status).toBe(200);
+      expect(a.store.getPeer('cu')!.folders).toEqual([fb]);
+      expect((await local(a, '/local/peers/remove', { name: 'cu' })).status).toBe(200);
+      expect(a.store.listPeers()).toEqual([]);
     });
   });
 });

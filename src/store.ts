@@ -3,6 +3,15 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { PeerMessage, ThreadRecord } from './protocol.ts';
 
+export interface PeerRecord {
+  name: string;
+  url: string;
+  token: string;
+  folders: string[];
+}
+
+export type InviteTake = { ok: true; folders: string[] } | { ok: false; reason: 'unknown' | 'used' | 'expired' };
+
 export interface OutboxEntry {
   message: PeerMessage;
   peer: string;
@@ -40,6 +49,19 @@ export class BridgeStore {
         session_id TEXT,
         cwd TEXT,
         updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS peers (
+        name TEXT PRIMARY KEY,
+        url TEXT NOT NULL,
+        token TEXT NOT NULL,
+        folders TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS invites (
+        secret_hash TEXT PRIMARY KEY,
+        folders TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY,
@@ -138,9 +160,54 @@ export class BridgeStore {
     this.db.prepare('DELETE FROM outbox WHERE id = ?').run(id);
   }
 
+  upsertPeer(p: PeerRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO peers (name, url, token, folders, created_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (name) DO UPDATE SET url = excluded.url, token = excluded.token, folders = excluded.folders`,
+      )
+      .run(p.name, p.url, p.token, JSON.stringify(p.folders), Date.now());
+  }
+
+  getPeer(name: string): PeerRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM peers WHERE name = ?').get(name) as Row | undefined;
+    return row ? toPeer(row) : undefined;
+  }
+
+  listPeers(): PeerRecord[] {
+    return (this.db.prepare('SELECT * FROM peers ORDER BY name').all() as Row[]).map(toPeer);
+  }
+
+  setPeerFolders(name: string, folders: string[]): boolean {
+    return Number(this.db.prepare('UPDATE peers SET folders = ? WHERE name = ?').run(JSON.stringify(folders), name).changes) > 0;
+  }
+
+  removePeer(name: string): boolean {
+    return Number(this.db.prepare('DELETE FROM peers WHERE name = ?').run(name).changes) > 0;
+  }
+
+  createInvite(secretHash: string, folders: string[], expiresAt: number): void {
+    this.db.prepare('INSERT INTO invites (secret_hash, folders, expires_at) VALUES (?, ?, ?)').run(secretHash, JSON.stringify(folders), expiresAt);
+  }
+
+  /** Atomically consumes an invite; a second take of the same invite fails with 'used'. */
+  takeInvite(secretHash: string, now: number): InviteTake {
+    const row = this.db.prepare('SELECT * FROM invites WHERE secret_hash = ?').get(secretHash) as Row | undefined;
+    if (!row) return { ok: false, reason: 'unknown' };
+    if (row.used_at !== null) return { ok: false, reason: 'used' };
+    if (Number(row.expires_at) < now) return { ok: false, reason: 'expired' };
+    const res = this.db.prepare('UPDATE invites SET used_at = ? WHERE secret_hash = ? AND used_at IS NULL').run(now, secretHash);
+    if (Number(res.changes) === 0) return { ok: false, reason: 'used' };
+    return { ok: true, folders: JSON.parse(String(row.folders)) as string[] };
+  }
+
   close(): void {
     this.db.close();
   }
+}
+
+function toPeer(r: Row): PeerRecord {
+  return { name: String(r.name), url: String(r.url), token: String(r.token), folders: JSON.parse(String(r.folders)) as string[] };
 }
 
 function toMessage(r: Row): PeerMessage {

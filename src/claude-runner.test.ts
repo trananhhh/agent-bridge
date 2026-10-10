@@ -2,28 +2,39 @@ import { describe, expect, it } from 'vitest';
 import { buildClaudeArgs, parseClaudeJson } from './claude-runner.ts';
 
 describe('buildClaudeArgs', () => {
-  it('builds a locked-down headless invocation (prompt goes via stdin)', () => {
-    const args = buildClaudeArgs({ allowedTools: ['Read', 'Bash(git log:*)'], appendSystemPrompt: 'be brief' });
-    expect(args).toEqual([
+  it('locks a peer session to read-only tools inside the shared folders', () => {
+    expect(buildClaudeArgs({ readOnlyDirs: ['/w/a', '/w/b'], appendSystemPrompt: 'be brief' })).toEqual([
       '-p',
       '--output-format',
       'json',
       '--permission-mode',
       'dontAsk',
+      '--restricted',
+      '--strict-mcp-config',
+      '--tools',
+      'Read,Grep,Glob,WebSearch',
       '--allowedTools',
-      'Read,Bash(git log:*)',
+      'Read,Grep,Glob,WebSearch',
+      '--disallowedTools',
+      'Edit,Write,NotebookEdit',
+      '--add-dir',
+      '/w/a',
+      '--add-dir',
+      '/w/b',
       '--append-system-prompt',
       'be brief',
     ]);
   });
 
-  it('adds resume, fork, model and disables tools for the classifier', () => {
+  it('resumes/forks and runs the classifier with no tools at all', () => {
     expect(buildClaudeArgs({ resumeSessionId: 's1', fork: true, model: 'haiku', noTools: true })).toEqual([
       '-p',
       '--output-format',
       'json',
       '--permission-mode',
       'dontAsk',
+      '--restricted',
+      '--strict-mcp-config',
       '--resume',
       's1',
       '--fork-session',

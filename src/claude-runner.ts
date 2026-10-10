@@ -6,7 +6,8 @@ export interface ClaudeRunOptions {
   resumeSessionId?: string;
   fork?: boolean;
   model?: string;
-  allowedTools?: string[];
+  /** Peer-facing session: read-only tools, confined to cwd + these folders. */
+  readOnlyDirs?: string[];
   noTools?: boolean;
   appendSystemPrompt?: string;
   timeoutMs?: number;
@@ -21,16 +22,22 @@ export interface ClaudeRunResult {
 export type ClaudeRunner = (opts: ClaudeRunOptions) => Promise<ClaudeRunResult>;
 
 const STDOUT_CAP = 5 * 1024 * 1024;
+export const READ_ONLY_TOOLS = 'Read,Grep,Glob,WebSearch';
+const WRITE_TOOLS = 'Edit,Write,NotebookEdit';
 // Child must not think it is nested inside the session that spawned the daemon.
 const STRIPPED_ENV = ['CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_ENTRYPOINT', 'BRIDGE_LIVE'];
 
 export function buildClaudeArgs(opts: Omit<ClaudeRunOptions, 'prompt' | 'cwd' | 'timeoutMs'>): string[] {
-  const args = ['-p', '--output-format', 'json', '--permission-mode', 'dontAsk'];
+  // --restricted: no shell/code tools, user/project settings and hooks ignored, file tools confined to cwd + --add-dir.
+  const args = ['-p', '--output-format', 'json', '--permission-mode', 'dontAsk', '--restricted', '--strict-mcp-config'];
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
   if (opts.resumeSessionId && opts.fork) args.push('--fork-session');
   if (opts.model) args.push('--model', opts.model);
   if (opts.noTools) args.push('--tools=');
-  if (opts.allowedTools?.length) args.push('--allowedTools', opts.allowedTools.join(','));
+  if (opts.readOnlyDirs) {
+    args.push('--tools', READ_ONLY_TOOLS, '--allowedTools', READ_ONLY_TOOLS, '--disallowedTools', WRITE_TOOLS);
+    for (const d of opts.readOnlyDirs) args.push('--add-dir', d);
+  }
   if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt);
   return args;
 }

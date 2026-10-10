@@ -12,18 +12,17 @@ const PROJECTS_ROOT = join(homedir(), '.claude', 'projects');
 
 export async function runDaemon(): Promise<void> {
   const cfg = loadConfig();
-  if (cfg.peers.length === 0) console.error('warning: no peers configured yet (agent-bridge add-peer <name> <url>)');
   const store = new BridgeStore(DB_PATH);
+  const publicUrl = `http://${cfg.listenHost}:${cfg.peerPort}`;
 
   const daemon = createDaemon({
     name: cfg.name,
-    peers: cfg.peers,
+    publicUrl,
     store,
     runner: createClaudeRunner(cfg.claudeBin),
     listSessions: (allowedDirs) =>
       listRecentSessions(PROJECTS_ROOT, { now: Date.now(), sinceHours: cfg.routing.recentHours, limit: cfg.routing.recentLimit, allowedDirs }),
-    headlessAllowedTools: cfg.headless.allowedTools,
-    headlessTimeoutMs: cfg.headless.timeoutMs,
+    headlessTimeoutMs: cfg.headlessTimeoutMs,
     activeWindowMs: cfg.routing.activeWindowMin * 60_000,
     classifierModel: cfg.routing.classifierModel,
   });
@@ -40,7 +39,8 @@ export async function runDaemon(): Promise<void> {
       name: cfg.name,
       peer: `${cfg.listenHost}:${cfg.peerPort}`,
       local: `127.0.0.1:${cfg.localPort}`,
-      peers: cfg.peers.map((p) => `${p.name}=${p.url} [${p.workdirs.join(', ')}]`),
+      url: publicUrl,
+      peers: store.listPeers().map((p) => `${p.name}=${p.url} [${p.folders.join(', ')}]`),
     }),
   );
 
