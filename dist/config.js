@@ -24,6 +24,14 @@ const ConfigSchema = z.object({
         classifierModel: z.string().default('haiku'),
     })
         .prefault({}),
+    /** Read-only mirror of every exchange into a Telegram channel (set up with `agent-bridge telegram`). */
+    telegram: z
+        .object({
+        botToken: z.string().min(1),
+        chatId: z.union([z.number(), z.string().min(1)]),
+        chatTitle: z.string().optional(),
+    })
+        .optional(),
 });
 export function expandPath(p, home = homedir()) {
     const expanded = resolve(p === '~' ? home : p.startsWith('~/') ? join(home, p.slice(2)) : p).replace(/(.)\/+$/, '$1');

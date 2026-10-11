@@ -14,6 +14,16 @@ describe('parseConfig', () => {
     });
   });
 
+  it('accepts an optional Telegram mirror target', () => {
+    expect(parseConfig({ name: 'anh', listenHost: '100.1.2.3' }).telegram).toBeUndefined();
+    expect(parseConfig({ name: 'anh', listenHost: '100.1.2.3', telegram: { botToken: '1:x', chatId: -1001, chatTitle: 'log' } }).telegram).toEqual({
+      botToken: '1:x',
+      chatId: -1001,
+      chatTitle: 'log',
+    });
+    expect(() => parseConfig({ name: 'anh', listenHost: '100.1.2.3', telegram: { chatId: -1001 } })).toThrow();
+  });
+
   it('rejects bad names and a missing listen host', () => {
     expect(() => parseConfig({ name: 'Anh Tran', listenHost: '100.1.2.3' })).toThrow(/name/);
     expect(() => parseConfig({ name: 'anh' })).toThrow(/listenHost/);

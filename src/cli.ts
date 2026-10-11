@@ -9,7 +9,9 @@ import { buildAgentNote } from './agent-note.ts';
 import { BRIDGE_HOME, CONFIG_PATH, VERSION, expandPath, loadConfig, readRawConfig, writeRawConfig, type RawConfig } from './config.ts';
 import { findBridges, parseTailscaleStatus, type FoundBridge } from './discovery.ts';
 import { IS_WIN, claudeInvocation, copyToClipboard, findClaude, installService, openUrl, serviceInstalled, uninstallService } from './platform.ts';
+import { shortThreadId } from './protocol.ts';
 import { tailscaleStatus, tailscaleWhois } from './tailscale.ts';
+import { channelsFromUpdates, telegramCall, type TelegramUpdate } from './telegram.ts';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
 const LOG_PATH = join(BRIDGE_HOME, 'daemon.log');
@@ -34,6 +36,7 @@ const HELP = `agent-bridge ${VERSION} — let Claude Code agents on different ma
   agent-bridge folders <name>   change which folders that person can read
   agent-bridge remove <name>    disconnect
   agent-bridge log [thread] [-f] what the agents said to each other (-f: keep watching)
+  agent-bridge telegram [off]   mirror every message into a read-only Telegram channel
   agent-bridge status           check daemon, Tailscale and each connection
   agent-bridge uninstall        stop the daemon, remove the MCP server (keeps ~/.agent-bridge)
 `;
@@ -164,6 +167,23 @@ async function waitForDaemon(port: number): Promise<boolean> {
   return false;
 }
 
+/** Installs (or reinstalls, which restarts) the background service. */
+function startDaemon(claudeBin: string): string | undefined {
+  return installService({
+    nodePath: process.execPath,
+    cliPath: CLI_PATH,
+    bridgeHome: BRIDGE_HOME,
+    logPath: LOG_PATH,
+    bridgeHomeEnv: process.env.BRIDGE_HOME,
+    claudeDir: claudeBin.includes('/') ? dirname(claudeBin) : undefined,
+  });
+}
+
+async function restartDaemon(raw: RawConfig): Promise<void> {
+  if (!startDaemon(raw.claudeBin ?? 'claude')) return console.log('! restart `agent-bridge daemon` yourself to apply this');
+  if (!(await waitForDaemon(raw.localPort ?? 8791))) console.log(`! daemon not responding yet — check ${LOG_PATH}`);
+}
+
 async function cmdSetup(argv: string[]): Promise<void> {
   const { values } = parseArgs({ args: argv, options: { name: { type: 'string' } } });
   if (/[\\/]_npx[\\/]/.test(CLI_PATH)) {
@@ -183,14 +203,7 @@ async function cmdSetup(argv: string[]): Promise<void> {
   const raw: RawConfig = { ...existing, name, listenHost: selfIp, claudeBin };
   writeRawConfig(raw);
   console.log(`✓ name: ${name} · Tailscale ${selfIp}`);
-  const service = installService({
-    nodePath: process.execPath,
-    cliPath: CLI_PATH,
-    bridgeHome: BRIDGE_HOME,
-    logPath: LOG_PATH,
-    bridgeHomeEnv: process.env.BRIDGE_HOME,
-    claudeDir: claudeBin.includes('/') ? dirname(claudeBin) : undefined,
-  });
+  const service = startDaemon(claudeBin);
   if (service) console.log(`✓ daemon running in the background — ${service} (log: ${LOG_PATH})`);
   else console.log('! Linux: keep `agent-bridge daemon` running under systemd/tmux yourself');
   registerMcp(claudeBin);
@@ -315,9 +328,6 @@ interface LogMessage {
   received_at: number;
 }
 
-const UUID_LEN = 36;
-/** "<asker>-<uuid>" → "<asker>-<first 8 of uuid>", still a unique prefix for `agent-bridge log <thread>`. */
-const shortThread = (id: string) => (id.length > UUID_LEN ? id.slice(0, id.length - UUID_LEN + 8) : id);
 const stamp = (ms: number) => new Date(ms).toLocaleString('sv-SE', { hour12: false }).slice(5, 16);
 const firstLine = (text: string, max: number) => {
   const line = text.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
@@ -325,7 +335,7 @@ const firstLine = (text: string, max: number) => {
 };
 
 function printMessage(m: LogMessage, withThread: boolean): void {
-  const thread = withThread ? `  [${shortThread(m.thread_id)}]` : '';
+  const thread = withThread ? `  [${shortThreadId(m.thread_id)}]` : '';
   console.log(`\n── ${stamp(m.received_at)} · ${m.from} · ${m.kind === 'ask' ? 'asks' : 'answers'}${thread} ──\n${m.text}`);
 }
 
@@ -352,7 +362,7 @@ async function cmdLog(argv: string[]): Promise<void> {
     for (const t of threads.reverse()) {
       const who = t.origin === 'remote' ? `← ${t.peer} asked` : `→ asked ${t.peer ?? '?'}`;
       const state = t.origin === 'local' && t.last_kind === 'ask' ? 'waiting' : `${t.count} msgs`;
-      console.log(`${stamp(t.last_at)}  ${shortThread(t.thread_id).padEnd(22)} ${who.padEnd(20)} ${state}\n    ${firstLine(t.first_text, 100)}`);
+      console.log(`${stamp(t.last_at)}  ${shortThreadId(t.thread_id).padEnd(22)} ${who.padEnd(20)} ${state}\n    ${firstLine(t.first_text, 100)}`);
     }
     console.log('\nFull thread: agent-bridge log <thread>   ·   watch live: agent-bridge log -f');
   }
@@ -393,6 +403,7 @@ async function cmdStatus(): Promise<void> {
   const cfg = loadConfig();
   console.log(`agent-bridge ${VERSION} · ${cfg.name} · http://${cfg.listenHost}:${cfg.peerPort}`);
   console.log(`service: ${serviceInstalled() ? `installed (log ${LOG_PATH})` : 'not installed'}`);
+  if (cfg.telegram) console.log(`telegram: mirroring to ${cfg.telegram.chatTitle ?? cfg.telegram.chatId}`);
   let peers: PeerView[] = [];
   try {
     const s = await api<{ live: number; outbox: number }>('/local/status');
@@ -411,6 +422,56 @@ async function cmdStatus(): Promise<void> {
     }
     console.log(`${p.name}: ${state}`);
   }
+}
+
+const TELEGRAM_GUIDE = `Mirror every message between the agents into a Telegram channel (members can only read):
+  1. In Telegram, open @BotFather → /newbot → copy the token it gives you
+  2. Create a channel (private is fine) and invite the people who should read along
+  3. Channel → Administrators → add your bot (it only needs "Post messages")
+  Do this on ONE machine per conversation: both sides keep both directions, so two mirrors post everything twice.
+  Messages leave your Tailscale network and are stored by Telegram.`;
+
+async function cmdTelegram(argv: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { chat: { type: 'string' } } });
+  const raw = readRawConfig();
+  if (positionals[0] === 'off') {
+    delete raw.telegram;
+    writeRawConfig(raw);
+    await restartDaemon(raw);
+    return console.log('✓ Telegram mirror off');
+  }
+
+  console.log(`${TELEGRAM_GUIDE}\n`);
+  const token = (await ask('Bot token from @BotFather')).trim();
+  const bot = await telegramCall<{ username: string }>(token, 'getMe', {}).catch((err: Error) => {
+    throw new Error(`Telegram rejected that token (${err.message})`);
+  });
+  console.log(`✓ bot @${bot.username}`);
+
+  let chat: { id: number | string; title: string } | undefined;
+  if (values.chat) chat = { id: /^-?\d+$/.test(values.chat) ? Number(values.chat) : values.chat, title: values.chat };
+  else {
+    console.log(`Now add @${bot.username} to your channel as an administrator. Waiting up to 4 minutes…`);
+    for (let i = 0; i < 60 && !chat; i++) {
+      const updates = await telegramCall<TelegramUpdate[]>(token, 'getUpdates', { timeout: 4, allowed_updates: ['my_chat_member', 'channel_post'] });
+      const channels = channelsFromUpdates(updates);
+      if (channels.length === 1) chat = channels[0];
+      else if (channels.length > 1) {
+        channels.forEach((c, n) => console.log(`  ${n + 1}. ${c.title}`));
+        chat = channels[Number(await ask('Which channel?', '1')) - 1];
+      }
+    }
+    if (!chat) throw new Error('No channel found. Check the bot is an administrator there, or name it: agent-bridge telegram --chat <@channel | -100… id>');
+  }
+
+  await telegramCall(token, 'sendMessage', {
+    chat_id: chat.id,
+    text: `agent-bridge: from now on this channel shows every message between ${raw.name}'s agent and the agents it is connected to.`,
+  });
+  raw.telegram = { botToken: token, chatId: chat.id, chatTitle: chat.title };
+  writeRawConfig(raw);
+  await restartDaemon(raw);
+  console.log(`✓ mirroring to "${chat.title}" — new messages appear there within a few seconds`);
 }
 
 function cmdUninstall(): void {
@@ -455,6 +516,8 @@ async function main(): Promise<void> {
       return cmdRemove(rest);
     case 'log':
       return cmdLog(rest);
+    case 'telegram':
+      return cmdTelegram(rest);
     case 'status':
       return cmdStatus();
     case 'uninstall':

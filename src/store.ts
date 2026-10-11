@@ -108,6 +108,10 @@ export class BridgeStore {
         remote_folders TEXT,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -326,6 +330,15 @@ export class BridgeStore {
     this.db
       .prepare('UPDATE requests SET status = ?, remote_folders = COALESCE(?, remote_folders) WHERE id = ?')
       .run(status, remoteFolders ? JSON.stringify(remoteFolders) : null, id);
+  }
+
+  getKv(key: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM kv WHERE key = ?').get(key) as Row | undefined;
+    return row ? String(row.value) : undefined;
+  }
+
+  setKv(key: string, value: string): void {
+    this.db.prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value').run(key, value);
   }
 
   close(): void {

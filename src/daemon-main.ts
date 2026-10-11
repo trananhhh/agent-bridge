@@ -10,8 +10,10 @@ import { listRecentSessions } from './sessions.ts';
 import { BridgeStore } from './store.ts';
 import { notify, removePidFile, writePidFile } from './platform.ts';
 import { tailscaleWhois } from './tailscale.ts';
+import { createTelegramMirror } from './telegram.ts';
 
 const OUTBOX_INTERVAL_MS = 30_000;
+const MIRROR_INTERVAL_MS = 3_000;
 const PROJECTS_ROOT = join(homedir(), '.claude', 'projects');
 
 /** Background launchers without stdio redirection (Windows Startup) pass --log. */
@@ -55,9 +57,20 @@ export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> 
     daemon.flushOutbox().catch((err) => console.error(JSON.stringify({ event: 'outbox_flush_failed', error: String(err) })));
   }, OUTBOX_INTERVAL_MS);
 
+  const mirror = cfg.telegram
+    ? createTelegramMirror({
+        store,
+        selfName: cfg.name,
+        target: cfg.telegram,
+        log: (event, data) => console.error(JSON.stringify({ t: new Date().toISOString(), event, ...data })),
+      })
+    : undefined;
+  const mirrorTimer = mirror && setInterval(() => void mirror.tick(), MIRROR_INTERVAL_MS);
+
   console.error(
     JSON.stringify({
       event: 'started',
+      telegram: cfg.telegram?.chatTitle ?? cfg.telegram?.chatId,
       version: VERSION,
       name: cfg.name,
       url: publicUrl,
@@ -71,6 +84,8 @@ export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> 
     stopping = true;
     console.error(JSON.stringify({ event: 'stopping', signal }));
     clearInterval(outboxTimer);
+    if (mirrorTimer) clearInterval(mirrorTimer);
+    await mirror?.tick();
     peerServer.close();
     localServer.close();
     await Promise.race([daemon.idle(), new Promise((r) => setTimeout(r, 5_000))]);

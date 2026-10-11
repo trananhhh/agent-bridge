@@ -7,3 +7,6 @@ export const PeerMessageSchema = z.object({
     text: z.string().min(1).max(32_000),
     sent_at: z.string().max(40),
 });
+const UUID_LEN = 36;
+/** Thread ids are "<asker>-<uuid>"; "<asker>-<first 8 of uuid>" is short and still a unique prefix. */
+export const shortThreadId = (id) => (id.length > UUID_LEN ? id.slice(0, id.length - UUID_LEN + 8) : id);

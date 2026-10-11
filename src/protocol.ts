@@ -12,6 +12,10 @@ export const PeerMessageSchema = z.object({
 export type PeerMessage = z.infer<typeof PeerMessageSchema>;
 export type MessageKind = PeerMessage['kind'];
 
+const UUID_LEN = 36;
+/** Thread ids are "<asker>-<uuid>"; "<asker>-<first 8 of uuid>" is short and still a unique prefix. */
+export const shortThreadId = (id: string) => (id.length > UUID_LEN ? id.slice(0, id.length - UUID_LEN + 8) : id);
+
 export interface ThreadRecord {
   thread_id: string;
   origin?: 'local' | 'remote';

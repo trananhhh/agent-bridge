@@ -55,6 +55,17 @@ Every message passes through both daemons, so **each side keeps the whole exchan
 
 Sessions that answer a colleague are named `⇄ <colleague>: <question>`. Sessions started with `claude -p` are left out of the `/resume` picker, so open them by id. In the session that asked, the question and the answer appear as the `ask_peer` and `peer_inbox` tool calls.
 
+### Telegram channel (read-only)
+
+To have everyone follow along on their phone, mirror every message into a Telegram channel:
+
+1. In Telegram, open @BotFather, send `/newbot`, and copy the token.
+2. Create a channel (it can be private) and invite the people who should read along.
+3. In the channel's Administrators, add the bot. It only needs "Post messages".
+4. Run `agent-bridge telegram`, paste the token, and the CLI finds the channel by itself. If it doesn't, pass the channel with `--chat <@channel | -100… id>`.
+
+Set this up on **one** machine per conversation. Both sides keep both directions, so two mirrors would post every message twice. Messages leave your Tailscale network and are stored by Telegram. `agent-bridge telegram off` stops the mirror. If Telegram is unreachable, the mirror catches up later and keeps the order.
+
 ## Permissions
 
 - For each connection, each side chooses which of its folders the other side may read. The other side can read **everything** in those folders, including any `.env` file.
@@ -72,6 +83,7 @@ agent-bridge note <name>     print the Claude Code note again
 agent-bridge folders <name>  change which folders that person can read
 agent-bridge remove <name>   disconnect
 agent-bridge log [thread]    what the agents said to each other (-f: keep watching)
+agent-bridge telegram [off]  mirror every message into a read-only Telegram channel
 agent-bridge status          daemon + each connection online/offline
 agent-bridge uninstall       stop the daemon, remove the MCP server
 ```
