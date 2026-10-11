@@ -36,7 +36,7 @@ const HELP = `agent-bridge ${VERSION} — let Claude Code agents on different ma
   agent-bridge folders <name>   change which folders that person can read
   agent-bridge remove <name>    disconnect
   agent-bridge log [thread] [-f] what the agents said to each other (-f: keep watching)
-  agent-bridge telegram [off]   post every message to a read-only Telegram channel (--token, --chat to skip prompts)
+  agent-bridge telegram [off]   post every message to a read-only Telegram channel (--token=, --chat= to skip prompts)
   agent-bridge status           check daemon, Tailscale and each connection
   agent-bridge uninstall        stop the daemon, remove the MCP server (keeps ~/.agent-bridge)
 `;
@@ -503,7 +503,7 @@ async function cmdTelegram(argv: string[]): Promise<void> {
   await restartDaemon(raw);
   console.log(`✓ mirroring to "${chat.title}"`);
   console.log(
-    `\nColleagues can post their side to the same channel (each message still appears once). Send them this privately:\n  agent-bridge telegram --token ${token} --chat ${chat.id}`,
+    `\nColleagues can post their side to the same chat (each message still appears once). Send them this privately:\n  agent-bridge telegram --token=${token} --chat=${chat.id}`,
   );
 }
 
