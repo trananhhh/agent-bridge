@@ -180,15 +180,21 @@ export function createDaemon(opts) {
             let text;
             let sessionId;
             log('headless_start', { thread: msg.thread_id, from: peer.name, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
+            const run = (target) => opts.runner({
+                prompt: frameAsk(msg),
+                cwd,
+                resumeSessionId: target?.sessionId,
+                fork: target?.fork,
+                readOnlyDirs: peer.folders,
+                appendSystemPrompt: headlessSystemPrompt(peer.name),
+                timeoutMs: opts.headlessTimeoutMs,
+            });
             try {
-                const res = await opts.runner({
-                    prompt: frameAsk(msg),
-                    cwd,
-                    resumeSessionId: resume?.sessionId,
-                    fork: resume?.fork,
-                    readOnlyDirs: peer.folders,
-                    appendSystemPrompt: headlessSystemPrompt(peer.name),
-                    timeoutMs: opts.headlessTimeoutMs,
+                const res = await run(resume).catch((err) => {
+                    if (!resume)
+                        throw err;
+                    log('resume_failed', { thread: msg.thread_id, resume: resume.sessionId, error: err.message });
+                    return run();
                 });
                 sessionId = res.sessionId || undefined;
                 text = res.isError ? `[agent-bridge] ${opts.name}'s session reported an error: ${res.result}` : res.result.trim() || '(empty answer)';

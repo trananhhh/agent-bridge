@@ -21,6 +21,7 @@ interface Side {
   notifications: string[];
   classifierAnswer: string;
   runnerError?: Error;
+  resumeError?: Error;
   down: boolean;
 }
 
@@ -34,6 +35,7 @@ describe('agent-bridge daemon', () => {
       side.calls.push(opts);
       if (opts.noTools) return { sessionId: 'classifier', result: side.classifierAnswer, isError: false };
       if (side.runnerError) throw side.runnerError;
+      if (opts.resumeSessionId && side.resumeError) throw side.resumeError;
       const sessionId = opts.resumeSessionId && !opts.fork ? opts.resumeSessionId : `${side.name}-new-${++n}`;
       return { sessionId, result: `${side.name}#${n}`, isError: false };
     };
@@ -217,6 +219,17 @@ describe('agent-bridge daemon', () => {
     await settle();
     expect(a.store.outbox()).toHaveLength(0);
     expect(work(b)).toHaveLength(1);
+  });
+
+  it('a session that can no longer be resumed falls back to a fresh session instead of failing', async () => {
+    const got = liveInbox(a, 'a-conn');
+    b.sessions = [{ sessionId: 'gone', cwd: '/w/shared', title: 'deleted', mtimeMs: NOW - 60 * 60_000 }];
+    b.classifierAnswer = '{"session_id":"gone"}';
+    b.resumeError = new Error('No conversation found with session ID: gone');
+    await a.daemon.send({ kind: 'ask', text: 'q', connId: 'a-conn' });
+    await settle();
+    expect(work(b).map((c) => c.resumeSessionId)).toEqual(['gone', undefined]);
+    expect(got[0].text).toBe(`${b.name}#1`);
   });
 
   it('headless failure still answers the peer', async () => {

@@ -241,15 +241,21 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       let text: string;
       let sessionId: string | undefined;
       log('headless_start', { thread: msg.thread_id, from: peer.name, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
-      try {
-        const res = await opts.runner({
+      const run = (target?: { sessionId: string; fork?: boolean }) =>
+        opts.runner({
           prompt: frameAsk(msg),
           cwd,
-          resumeSessionId: resume?.sessionId,
-          fork: resume?.fork,
+          resumeSessionId: target?.sessionId,
+          fork: target?.fork,
           readOnlyDirs: peer.folders,
           appendSystemPrompt: headlessSystemPrompt(peer.name),
           timeoutMs: opts.headlessTimeoutMs,
+        });
+      try {
+        const res = await run(resume).catch((err: Error) => {
+          if (!resume) throw err;
+          log('resume_failed', { thread: msg.thread_id, resume: resume.sessionId, error: err.message });
+          return run();
         });
         sessionId = res.sessionId || undefined;
         text = res.isError ? `[agent-bridge] ${opts.name}'s session reported an error: ${res.result}` : res.result.trim() || '(empty answer)';

@@ -2,6 +2,8 @@ import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync, stat
 import { join, sep } from 'node:path';
 const CHUNK_BYTES = 256 * 1024;
 const FIELD_MAX = 300;
+// `claude -p --resume` only accepts a session UUID. Subagent transcripts (agent-<hex>.jsonl) sit next to sessions but are not resumable.
+const SESSION_FILE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 export function isWithin(path, dirs) {
     if (!path)
         return false;
@@ -21,12 +23,13 @@ export function listRecentSessions(projectsRoot, opts) {
             continue;
         const dir = join(projectsRoot, project.name);
         for (const f of readdirSync(dir, { withFileTypes: true })) {
-            if (!f.isFile() || !f.name.endsWith('.jsonl'))
+            const sessionId = f.isFile() ? SESSION_FILE.exec(f.name)?.[1] : undefined;
+            if (!sessionId)
                 continue;
             const file = join(dir, f.name);
             const mtimeMs = statSync(file).mtimeMs;
             if (mtimeMs >= cutoff)
-                files.push({ file, sessionId: f.name.slice(0, -'.jsonl'.length), mtimeMs });
+                files.push({ file, sessionId, mtimeMs });
         }
     }
     files.sort((x, y) => y.mtimeMs - x.mtimeMs);
