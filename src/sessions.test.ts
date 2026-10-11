@@ -75,6 +75,14 @@ describe('listRecentSessions', () => {
     ]);
   });
 
+  it('skips copies of sessions that run on another machine over SSH (desktop app ssh-* projects)', () => {
+    writeSession(`ssh-${uuid('fff')}`, uuid('fff'), [user('/w/shop', 'remote session copy')], now - 1_000);
+    writeSession('-w-shop', uuid('ddd'), [user('/w/shop', 'local session')], now - 2_000);
+    expect(listRecentSessions(root, { now, sinceHours: 48, limit: 10, allowedDirs: ['/w/shop'] }).map((s) => s.sessionId)).toEqual([
+      uuid('ddd'),
+    ]);
+  });
+
   it('skips transcripts that cannot be resumed by id (subagent agent-*.jsonl and other non-UUID names)', () => {
     writeSession('-w-shop', 'agent-a4facc464943ead88', [user('/w/shop', 'subagent work')], now - 1_000);
     writeSession('-w-shop', 'scratch', [user('/w/shop', 'not a session')], now - 2_000);

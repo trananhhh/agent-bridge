@@ -1,6 +1,6 @@
 {
   "name": "@trananhhh/agent-bridge",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "description": "Let Claude Code agents on different machines talk to each other over Tailscale",
   "type": "module",

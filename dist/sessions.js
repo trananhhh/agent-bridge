@@ -3,6 +3,7 @@ import { join, sep } from 'node:path';
 const CHUNK_BYTES = 256 * 1024;
 const FIELD_MAX = 300;
 // `claude -p --resume` only accepts a session UUID. Subagent transcripts (agent-<hex>.jsonl) sit next to sessions but are not resumable.
+const REMOTE_PROJECT_PREFIX = 'ssh-';
 const SESSION_FILE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 export function isWithin(path, dirs) {
     if (!path)
@@ -19,7 +20,8 @@ export function listRecentSessions(projectsRoot, opts) {
     const cutoff = opts.now - opts.sinceHours * 3600_000;
     const files = [];
     for (const project of readdirSync(projectsRoot, { withFileTypes: true })) {
-        if (!project.isDirectory())
+        // ssh-* holds the desktop app's local copy of a session that runs on another machine; resuming it here would answer with the wrong files.
+        if (!project.isDirectory() || project.name.startsWith(REMOTE_PROJECT_PREFIX))
             continue;
         const dir = join(projectsRoot, project.name);
         for (const f of readdirSync(dir, { withFileTypes: true })) {
