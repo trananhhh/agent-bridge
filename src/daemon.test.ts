@@ -41,7 +41,7 @@ describe('agent-bridge daemon', () => {
     };
   }
 
-  function addSide(name: string, peers: { name: string; folders?: string[] }[]): Side {
+  function addSide(name: string, peers: { name: string; folders?: string[] }[], extra: { mirrorChat?: string } = {}): Side {
     const side = {
       name,
       store: new BridgeStore(join(dir, `${name}.db`)),
@@ -75,6 +75,7 @@ describe('agent-bridge daemon', () => {
       now: () => NOW,
       log: () => {},
       notify: (title: string) => side.notifications.push(title),
+      ...extra,
       fetchImpl: async (url, init) => {
         if (side.down) throw new Error('ECONNREFUSED');
         const target = net.get(new URL(url).hostname.replace(/\.test$/, ''));
@@ -248,6 +249,20 @@ describe('agent-bridge daemon', () => {
       await settle();
     }
     expect(work(b).map((c) => c.name)).toEqual([`⇄ ${a.name}: Does orders have a provider_id column? It matters for the…`, `⇄ ${a.name}: q2`, undefined]);
+  });
+
+  it('tags outgoing messages with the Telegram chat this side mirrors to, and the receiver keeps the tag', async () => {
+    const m = addSide('minh', [{ name: 'cu' }], { mirrorChat: '-1001' });
+    b.store.upsertPeer({ name: 'minh', url: 'http://minh.test', token: pairToken('cu', 'minh'), folders: ['/w/shared'], remoteFolders: [] });
+    liveInbox(m, 'm-conn');
+    const sent = await m.daemon.send({ kind: 'ask', text: 'q', connId: 'm-conn', to: 'cu' });
+    await settle();
+    expect(m.store.threadMessages(sent.thread_id)[0].mirror).toBe('-1001');
+    const atCu = b.store.threadMessages(sent.thread_id);
+    expect(atCu.map((x) => [x.direction, x.mirror])).toEqual([
+      ['in', '-1001'],
+      ['out', undefined],
+    ]);
   });
 
   it('serves the conversation log to the local CLI', async () => {

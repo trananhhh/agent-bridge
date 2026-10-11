@@ -81,6 +81,7 @@ export function createDaemon(opts) {
             kind: input.kind,
             text: input.text,
             sent_at: new Date(now()).toISOString(),
+            ...(opts.mirrorChat ? { mirror: opts.mirrorChat } : {}),
         };
         store.insertMessage(msg, 'out');
         store.upsertThread({

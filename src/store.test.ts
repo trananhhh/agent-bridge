@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { BridgeStore } from './store.ts';
 import type { PeerMessage } from './protocol.ts';
 
@@ -79,6 +80,18 @@ describe('BridgeStore', () => {
     ]);
     expect(store.messagesAfter(log[0].seq).map((m) => m.id)).toEqual(['a1', 'q2']);
     expect(store.latestSeq()).toBe(store.messagesAfter(0).at(-1)?.seq);
+  });
+
+  it('adds the mirror column to a database created by an older version', () => {
+    store.close();
+    const old = join(dir, 'old.db');
+    const raw = new DatabaseSync(old);
+    raw.exec(`CREATE TABLE messages (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, direction TEXT NOT NULL, sender TEXT NOT NULL,
+      kind TEXT NOT NULL, text TEXT NOT NULL, sent_at TEXT NOT NULL, received_at INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)`);
+    raw.close();
+    store = new BridgeStore(old);
+    store.insertMessage(msg({ id: 'x', mirror: '-1001' }), 'in');
+    expect(store.threadMessages('t1')[0].mirror).toBe('-1001');
   });
 
   it('tracks outbox retries per peer', () => {

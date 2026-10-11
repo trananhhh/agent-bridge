@@ -41,6 +41,7 @@ export async function runDaemon(opts = {}) {
         headlessTimeoutMs: cfg.headlessTimeoutMs,
         activeWindowMs: cfg.routing.activeWindowMin * 60_000,
         classifierModel: cfg.routing.classifierModel,
+        mirrorChat: cfg.telegram ? String(cfg.telegram.chatId) : undefined,
         whois: tailscaleWhois,
         notify,
     });

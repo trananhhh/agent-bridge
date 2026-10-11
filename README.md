@@ -57,14 +57,13 @@ Sessions that answer a colleague are named `⇄ <colleague>: <question>`. Sessio
 
 ### Telegram channel (read-only)
 
-To have everyone follow along on their phone, mirror every message into a Telegram channel:
+To follow along on your phone, run `agent-bridge telegram` (the first-run wizard offers it too):
 
-1. In Telegram, open @BotFather, send `/newbot`, and copy the token.
-2. Create a channel (it can be private) and invite the people who should read along.
-3. In the channel's Administrators, add the bot. It only needs "Post messages".
-4. Run `agent-bridge telegram`, paste the token, and the CLI finds the channel by itself. If it doesn't, pass the channel with `--chat <@channel | -100… id>`.
+1. **Bot.** Paste a token, or press Enter: the CLI opens @BotFather, where you send `/newbot` and copy the token.
+2. **Channel.** The CLI opens `t.me/<bot>?startchannel&admin=post_messages`. Pick your channel or create one, then confirm. That adds the bot as an admin that can post, and the CLI picks the channel up by itself.
+3. The CLI then prints `agent-bridge telegram --token … --chat …`. Send it privately to colleagues who should post to the same channel.
 
-Set this up on **one** machine per conversation. Both sides keep both directions, so two mirrors would post every message twice. Messages leave your Tailscale network and are stored by Telegram. `agent-bridge telegram off` stops the mirror. If Telegram is unreachable, the mirror catches up later and keeps the order.
+**Each machine posts the messages it sends**, so every message appears once, whether one side or both sides mirror. If the sender doesn't mirror to the same channel, the receiver posts the message instead. Messages leave your Tailscale network and are stored by Telegram. The mirror keeps its place across restarts and Telegram outages. To stop it, run `agent-bridge telegram off`.
 
 ## Permissions
 
@@ -83,7 +82,7 @@ agent-bridge note <name>     print the Claude Code note again
 agent-bridge folders <name>  change which folders that person can read
 agent-bridge remove <name>   disconnect
 agent-bridge log [thread]    what the agents said to each other (-f: keep watching)
-agent-bridge telegram [off]  mirror every message into a read-only Telegram channel
+agent-bridge telegram [off]  post every message to a read-only Telegram channel
 agent-bridge status          daemon + each connection online/offline
 agent-bridge uninstall       stop the daemon, remove the MCP server
 ```

@@ -83,6 +83,16 @@ describe('telegram mirror', () => {
     expect(posts()).toHaveLength(2);
   });
 
+  it('leaves an incoming message to its sender when the sender already posts it to this channel', async () => {
+    const m = mirror();
+    add({ text: 'sender posts this one', mirror: '-1001' }, 'in');
+    add({ text: 'sender mirrors elsewhere', mirror: '-2002' }, 'in');
+    add({ text: 'sender has no mirror' }, 'in');
+    add({ from: 'anh', kind: 'reply', text: 'mine', mirror: '-1001' }, 'out');
+    await m.tick();
+    expect(posts().map((p) => p.split('\n\n')[1])).toEqual(['sender mirrors elsewhere', 'sender has no mirror', 'mine']);
+  });
+
   it('splits long messages into numbered parts', async () => {
     const m = mirror();
     add({ text: `${'a'.repeat(3000)}\n${'b'.repeat(3000)}` }, 'in');

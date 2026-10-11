@@ -121,15 +121,17 @@ export class BridgeStore {
         created_at INTEGER NOT NULL
       );
     `);
+    const columns = (this.db.prepare('PRAGMA table_info(messages)').all() as Row[]).map((c) => c.name);
+    if (!columns.includes('mirror')) this.db.exec('ALTER TABLE messages ADD COLUMN mirror TEXT');
   }
 
   insertMessage(m: PeerMessage, direction: 'in' | 'out'): boolean {
     const res = this.db
       .prepare(
-        `INSERT OR IGNORE INTO messages (id, thread_id, direction, sender, kind, text, sent_at, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO messages (id, thread_id, direction, sender, kind, text, sent_at, received_at, mirror)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(m.id, m.thread_id, direction, m.from, m.kind, m.text, m.sent_at, Date.now());
+      .run(m.id, m.thread_id, direction, m.from, m.kind, m.text, m.sent_at, Date.now(), m.mirror ?? null);
     return Number(res.changes) > 0;
   }
 
@@ -376,7 +378,7 @@ function toLogged(r: Row): LoggedMessage {
 }
 
 function toMessage(r: Row): PeerMessage {
-  return {
+  const m: PeerMessage = {
     id: String(r.id),
     thread_id: String(r.thread_id),
     from: String(r.sender),
@@ -384,4 +386,6 @@ function toMessage(r: Row): PeerMessage {
     text: String(r.text),
     sent_at: String(r.sent_at),
   };
+  if (r.mirror) m.mirror = String(r.mirror);
+  return m;
 }

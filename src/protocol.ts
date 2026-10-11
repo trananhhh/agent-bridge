@@ -7,6 +7,8 @@ export const PeerMessageSchema = z.object({
   kind: z.enum(['ask', 'reply']),
   text: z.string().min(1).max(32_000),
   sent_at: z.string().max(40),
+  /** Telegram chat the sender mirrors this message to, so the receiver does not post it a second time. */
+  mirror: z.string().max(100).optional(),
 });
 
 export type PeerMessage = z.infer<typeof PeerMessageSchema>;

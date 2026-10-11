@@ -6,6 +6,8 @@ export const PeerMessageSchema = z.object({
     kind: z.enum(['ask', 'reply']),
     text: z.string().min(1).max(32_000),
     sent_at: z.string().max(40),
+    /** Telegram chat the sender mirrors this message to, so the receiver does not post it a second time. */
+    mirror: z.string().max(100).optional(),
 });
 const UUID_LEN = 36;
 /** Thread ids are "<asker>-<uuid>"; "<asker>-<first 8 of uuid>" is short and still a unique prefix. */

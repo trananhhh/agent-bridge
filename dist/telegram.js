@@ -65,6 +65,7 @@ export function channelsFromUpdates(updates) {
 }
 /**
  * Read-only mirror of this machine's agent-bridge log into a Telegram channel.
+ * Every message lands exactly once: its sender posts it, unless the sender has no mirror to this chat, in which case the receiver does.
  * Progress is a cursor in the store, so a crash, restart or Telegram outage never drops or reorders messages.
  */
 export function createTelegramMirror(opts) {
@@ -92,7 +93,9 @@ export function createTelegramMirror(opts) {
                     return;
                 for (const m of batch) {
                     try {
-                        await post(m);
+                        // Each side posts what it sends; an incoming message is posted here only if its sender doesn't mirror to this chat.
+                        if (m.direction === 'out' || m.mirror !== String(target.chatId))
+                            await post(m);
                         lastError = undefined;
                     }
                     catch (err) {

@@ -29,6 +29,8 @@ export interface DaemonOptions {
   headlessTimeoutMs: number;
   activeWindowMs: number;
   classifierModel?: string;
+  /** Telegram chat this machine mirrors its own messages to (tagged on each outgoing message). */
+  mirrorChat?: string;
   now?: () => number;
   log?: (event: string, data?: Record<string, unknown>) => void;
   fetchImpl?: (url: string, init: RequestInit) => Promise<Response>;
@@ -148,6 +150,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       kind: input.kind,
       text: input.text,
       sent_at: new Date(now()).toISOString(),
+      ...(opts.mirrorChat ? { mirror: opts.mirrorChat } : {}),
     };
     store.insertMessage(msg, 'out');
     store.upsertThread({

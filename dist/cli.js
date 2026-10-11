@@ -33,7 +33,7 @@ const HELP = `agent-bridge ${VERSION} — let Claude Code agents on different ma
   agent-bridge folders <name>   change which folders that person can read
   agent-bridge remove <name>    disconnect
   agent-bridge log [thread] [-f] what the agents said to each other (-f: keep watching)
-  agent-bridge telegram [off]   mirror every message into a read-only Telegram channel
+  agent-bridge telegram [off]   post every message to a read-only Telegram channel (--token, --chat to skip prompts)
   agent-bridge status           check daemon, Tailscale and each connection
   agent-bridge uninstall        stop the daemon, remove the MCP server (keeps ~/.agent-bridge)
 `;
@@ -380,14 +380,38 @@ async function cmdStatus() {
         console.log(`${p.name}: ${state}`);
     }
 }
-const TELEGRAM_GUIDE = `Mirror every message between the agents into a Telegram channel (members can only read):
-  1. In Telegram, open @BotFather → /newbot → copy the token it gives you
-  2. Create a channel (private is fine) and invite the people who should read along
-  3. Channel → Administrators → add your bot (it only needs "Post messages")
-  Do this on ONE machine per conversation: both sides keep both directions, so two mirrors post everything twice.
-  Messages leave your Tailscale network and are stored by Telegram.`;
+const BOTFATHER_URL = 'https://t.me/BotFather';
+const addToChannelUrl = (bot) => `https://t.me/${bot}?startchannel&admin=post_messages`;
+/** Resolves "@name" or "-100…" to the numeric id both sides compare, and checks the bot may post there. */
+async function resolveChannel(token, botId, chat) {
+    const info = await telegramCall(token, 'getChat', { chat_id: /^-?\d+$/.test(chat) ? Number(chat) : chat });
+    const member = await telegramCall(token, 'getChatMember', { chat_id: info.id, user_id: botId });
+    if (member.status !== 'administrator' || member.can_post_messages === false)
+        throw new Error(`the bot is not an admin that can post in "${info.title ?? chat}"`);
+    return { id: info.id, title: info.title ?? String(info.id) };
+}
+async function detectChannel(token, bot) {
+    const poll = async (timeout) => channelsFromUpdates(await telegramCall(token, 'getUpdates', { timeout, allowed_updates: ['my_chat_member', 'channel_post'] }));
+    let channels = await poll(0);
+    if (!channels.length) {
+        const link = addToChannelUrl(bot);
+        console.log(`\nTap this link, then pick your channel (or create one) and confirm — it adds @${bot} as an admin:\n  ${link}`);
+        openUrl(link);
+        console.log('Waiting up to 4 minutes…');
+        for (let i = 0; i < 48 && !channels.length; i++)
+            channels = await poll(5);
+    }
+    if (channels.length <= 1)
+        return channels[0];
+    channels.forEach((c, n) => console.log(`  ${n + 1}. ${c.title}`));
+    return channels[Number(await ask('Which channel?', '1')) - 1];
+}
 async function cmdTelegram(argv) {
-    const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { chat: { type: 'string' } } });
+    const { values, positionals } = parseArgs({
+        args: argv,
+        allowPositionals: true,
+        options: { token: { type: 'string' }, chat: { type: 'string' } },
+    });
     const raw = readRawConfig();
     if (positionals[0] === 'off') {
         delete raw.telegram;
@@ -395,38 +419,33 @@ async function cmdTelegram(argv) {
         await restartDaemon(raw);
         return console.log('✓ Telegram mirror off');
     }
-    console.log(`${TELEGRAM_GUIDE}\n`);
-    const token = (await ask('Bot token from @BotFather')).trim();
+    let token = values.token?.trim();
+    if (!token) {
+        console.log('Every message between the agents will be posted to a Telegram channel; its members can only read.');
+        console.log('Messages leave your Tailscale network and are stored by Telegram.\n');
+        token = (await ask('Bot token (got one from a colleague? paste it · none yet? press Enter)')).trim();
+        if (!token) {
+            console.log(`In Telegram: @BotFather → /newbot → pick a name and a username → copy the token.\n  ${BOTFATHER_URL}`);
+            openUrl(BOTFATHER_URL);
+            token = (await ask('Bot token')).trim();
+        }
+    }
     const bot = await telegramCall(token, 'getMe', {}).catch((err) => {
         throw new Error(`Telegram rejected that token (${err.message})`);
     });
     console.log(`✓ bot @${bot.username}`);
-    let chat;
-    if (values.chat)
-        chat = { id: /^-?\d+$/.test(values.chat) ? Number(values.chat) : values.chat, title: values.chat };
-    else {
-        console.log(`Now add @${bot.username} to your channel as an administrator. Waiting up to 4 minutes…`);
-        for (let i = 0; i < 60 && !chat; i++) {
-            const updates = await telegramCall(token, 'getUpdates', { timeout: 4, allowed_updates: ['my_chat_member', 'channel_post'] });
-            const channels = channelsFromUpdates(updates);
-            if (channels.length === 1)
-                chat = channels[0];
-            else if (channels.length > 1) {
-                channels.forEach((c, n) => console.log(`  ${n + 1}. ${c.title}`));
-                chat = channels[Number(await ask('Which channel?', '1')) - 1];
-            }
-        }
-        if (!chat)
-            throw new Error('No channel found. Check the bot is an administrator there, or name it: agent-bridge telegram --chat <@channel | -100… id>');
-    }
+    const chat = values.chat ? await resolveChannel(token, bot.id, values.chat) : await detectChannel(token, bot.username);
+    if (!chat)
+        throw new Error(`No channel found. Add @${bot.username} as a channel admin (${addToChannelUrl(bot.username)}), then run this again.`);
     await telegramCall(token, 'sendMessage', {
         chat_id: chat.id,
-        text: `agent-bridge: from now on this channel shows every message between ${raw.name}'s agent and the agents it is connected to.`,
+        text: `agent-bridge: ${raw.name}'s agent now posts the messages it sends and receives here.`,
     });
     raw.telegram = { botToken: token, chatId: chat.id, chatTitle: chat.title };
     writeRawConfig(raw);
     await restartDaemon(raw);
-    console.log(`✓ mirroring to "${chat.title}" — new messages appear there within a few seconds`);
+    console.log(`✓ mirroring to "${chat.title}"`);
+    console.log(`\nColleagues can post their side to the same channel (each message still appears once). Send them this privately:\n  agent-bridge telegram --token ${token} --chat ${chat.id}`);
 }
 function cmdUninstall() {
     uninstallService(BRIDGE_HOME);
@@ -437,6 +456,10 @@ function cmdUninstall() {
 async function cmdHome() {
     if (!existsSync(CONFIG_PATH)) {
         await cmdSetup([]);
+        console.log('');
+        if (await confirm('Also post every message between the agents to a Telegram channel, so people can read along?', false)) {
+            await cmdTelegram([]);
+        }
         console.log('');
     }
     if ((await handleRequests()) > 0)
