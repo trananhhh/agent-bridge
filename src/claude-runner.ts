@@ -6,6 +6,8 @@ export interface ClaudeRunOptions {
   cwd: string;
   resumeSessionId?: string;
   fork?: boolean;
+  /** Display name in the /resume picker and terminal title. */
+  name?: string;
   model?: string;
   /** Peer-facing session: read-only tools, confined to cwd + these folders. */
   readOnlyDirs?: string[];
@@ -33,6 +35,7 @@ export function buildClaudeArgs(opts: Omit<ClaudeRunOptions, 'prompt' | 'cwd' | 
   const args = ['-p', '--output-format', 'json', '--permission-mode', 'dontAsk', '--restricted', '--strict-mcp-config'];
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
   if (opts.resumeSessionId && opts.fork) args.push('--fork-session');
+  if (opts.name) args.push('-n', opts.name);
   if (opts.model) args.push('--model', opts.model);
   if (opts.noTools) args.push('--tools=');
   if (opts.readOnlyDirs) {

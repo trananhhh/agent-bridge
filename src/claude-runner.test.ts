@@ -26,6 +26,10 @@ describe('buildClaudeArgs', () => {
     ]);
   });
 
+  it('names the session so its owner can find it later', () => {
+    expect(buildClaudeArgs({ name: '⇄ cu: does orders have provider_id?' }).slice(-2)).toEqual(['-n', '⇄ cu: does orders have provider_id?']);
+  });
+
   it('resumes/forks and runs the classifier with no tools at all', () => {
     expect(buildClaudeArgs({ resumeSessionId: 's1', fork: true, model: 'haiku', noTools: true })).toEqual([
       '-p',

@@ -85,6 +85,56 @@ export class BridgeStore {
                 .all());
         return rows.map(toMessage);
     }
+    listThreads(limit) {
+        const rows = this.db
+            .prepare(`SELECT m.thread_id, t.peer, t.origin, t.session_id, COUNT(*) AS count,
+           MIN(m.received_at) AS started_at, MAX(m.received_at) AS last_at, MAX(m.rowid) AS last_seq,
+           (SELECT f.text FROM messages f WHERE f.thread_id = m.thread_id ORDER BY f.rowid LIMIT 1) AS first_text,
+           (SELECT f.sender FROM messages f WHERE f.thread_id = m.thread_id ORDER BY f.rowid LIMIT 1) AS first_sender,
+           (SELECT l.kind FROM messages l WHERE l.thread_id = m.thread_id ORDER BY l.rowid DESC LIMIT 1) AS last_kind
+         FROM messages m LEFT JOIN threads t ON t.thread_id = m.thread_id
+         GROUP BY m.thread_id ORDER BY last_seq DESC LIMIT ?`)
+            .all(limit);
+        return rows.map((r) => {
+            const t = {
+                thread_id: String(r.thread_id),
+                count: Number(r.count),
+                started_at: Number(r.started_at),
+                last_at: Number(r.last_at),
+                first_text: String(r.first_text),
+                first_sender: String(r.first_sender),
+                last_kind: r.last_kind,
+            };
+            if (r.peer)
+                t.peer = String(r.peer);
+            if (r.origin)
+                t.origin = r.origin;
+            if (r.session_id)
+                t.session_id = String(r.session_id);
+            return t;
+        });
+    }
+    /** Thread ids equal to, or starting with, `prefix` (at most 2 — more than one means ambiguous). */
+    findThreadIds(prefix) {
+        const exact = this.db.prepare('SELECT 1 FROM messages WHERE thread_id = ? LIMIT 1').get(prefix);
+        if (exact)
+            return [prefix];
+        const rows = this.db
+            .prepare('SELECT DISTINCT thread_id FROM messages WHERE substr(thread_id, 1, ?) = ? LIMIT 2')
+            .all(prefix.length, prefix);
+        return rows.map((r) => String(r.thread_id));
+    }
+    threadMessages(threadId) {
+        const rows = this.db.prepare('SELECT rowid AS seq, * FROM messages WHERE thread_id = ? ORDER BY rowid').all(threadId);
+        return rows.map(toLogged);
+    }
+    messagesAfter(seq, limit = 200) {
+        const rows = this.db.prepare('SELECT rowid AS seq, * FROM messages WHERE rowid > ? ORDER BY rowid LIMIT ?').all(seq, limit);
+        return rows.map(toLogged);
+    }
+    latestSeq() {
+        return Number(this.db.prepare('SELECT COALESCE(MAX(rowid), 0) AS seq FROM messages').get().seq);
+    }
     getThread(threadId) {
         const row = this.db.prepare('SELECT * FROM threads WHERE thread_id = ?').get(threadId);
         if (!row)
@@ -206,6 +256,9 @@ function toRequest(r) {
     if (r.remote_folders)
         req.remoteFolders = JSON.parse(String(r.remote_folders));
     return req;
+}
+function toLogged(r) {
+    return { ...toMessage(r), seq: Number(r.seq), direction: r.direction, received_at: Number(r.received_at) };
 }
 function toMessage(r) {
     return {

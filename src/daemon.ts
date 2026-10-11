@@ -72,6 +72,15 @@ const MAX_PENDING_REQUESTS = 20;
 const PEER_NAME = /^[a-z0-9_-]{1,50}$/;
 const CLASSIFIER_TIMEOUT_MS = 120_000;
 
+const SESSION_TITLE_MAX = 60;
+
+/** "⇄ cu: <first line of the question>" — how a peer-answering session shows up in the owner's session list. */
+function sessionTitle(peer: string, question: string): string {
+  const line = question.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  const clipped = line.length > SESSION_TITLE_MAX ? `${line.slice(0, SESSION_TITLE_MAX - 2).trimEnd()}…` : line;
+  return `⇄ ${peer}: ${clipped}`;
+}
+
 const headlessSystemPrompt = (peer: string) =>
   `You are answering a message from ${peer}'s Claude Code agent via agent-bridge; nobody is at this machine. ` +
   'You can only READ the folders shared with this person. You cannot write anything; if the request needs writing, editing or running commands, ' +
@@ -247,6 +256,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
           cwd,
           resumeSessionId: target?.sessionId,
           fork: target?.fork,
+          name: target && !target.fork ? undefined : sessionTitle(peer.name, msg.text),
           readOnlyDirs: peer.folders,
           appendSystemPrompt: headlessSystemPrompt(peer.name),
           timeoutMs: opts.headlessTimeoutMs,
@@ -472,6 +482,20 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     if (!store.removePeer(parsed.data.name)) return c.json({ error: `no peer named "${parsed.data.name}"` }, 404);
     return c.json({ removed: parsed.data.name });
   });
+  localApp.get('/local/threads', (c) => c.json({ threads: store.listThreads(Math.min(Number(c.req.query('limit')) || 30, 500)) }));
+  localApp.get('/local/threads/:id', (c) => {
+    const ids = store.findThreadIds(c.req.param('id'));
+    if (ids.length === 0) return c.json({ error: 'no such thread' }, 404);
+    if (ids.length > 1) return c.json({ error: 'more than one thread starts with that — give more characters' }, 409);
+    return c.json({ thread: store.getThread(ids[0]) ?? { thread_id: ids[0] }, messages: store.threadMessages(ids[0]) });
+  });
+  // Without ?after, only returns the cursor so a follower starts at "now".
+  localApp.get('/local/messages', (c) => {
+    const after = c.req.query('after');
+    const messages = after === undefined ? [] : store.messagesAfter(Number(after) || 0);
+    return c.json({ messages, latest: messages.at(-1)?.seq ?? store.latestSeq() });
+  });
+
   localApp.get('/local/status', (c) =>
     c.json({ name: opts.name, url: opts.publicUrl, peers: store.listPeers().map((p) => ({ name: p.name, url: p.url })), live: live.size, outbox: store.outbox().length }),
   );

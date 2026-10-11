@@ -232,6 +232,51 @@ describe('agent-bridge daemon', () => {
     expect(got[0].text).toBe(`${b.name}#1`);
   });
 
+  it('names fresh and forked answering sessions after the asker and question, never a session resumed in place', async () => {
+    liveInbox(a, 'a-conn');
+    b.sessions = [
+      { sessionId: 'idle', cwd: '/w/shared', title: 'old work', mtimeMs: NOW - 60 * 60_000 },
+      { sessionId: 'busy', cwd: '/w/shared', title: 'open in desktop', mtimeMs: NOW - 60_000 },
+    ];
+    for (const [choice, text] of [
+      ['null', '\n  Does orders have a provider_id column? It matters for the import\nsecond line'],
+      ['"busy"', 'q2'],
+      ['"idle"', 'q3'],
+    ]) {
+      b.classifierAnswer = `{"session_id":${choice}}`;
+      await a.daemon.send({ kind: 'ask', text, connId: 'a-conn' });
+      await settle();
+    }
+    expect(work(b).map((c) => c.name)).toEqual([`⇄ ${a.name}: Does orders have a provider_id column? It matters for the…`, `⇄ ${a.name}: q2`, undefined]);
+  });
+
+  it('serves the conversation log to the local CLI', async () => {
+    liveInbox(a, 'a-conn');
+    await a.daemon.send({ kind: 'ask', text: 'q', connId: 'a-conn' });
+    await settle();
+    const get = async (side: Side, path: string) => {
+      const res = await side.daemon.localApp.request(path);
+      return { status: res.status, body: (await res.json()) as Record<string, any> };
+    };
+    const { body: list } = await get(b, '/local/threads');
+    expect(list.threads).toHaveLength(1);
+    expect(list.threads[0]).toMatchObject({ peer: a.name, origin: 'remote', count: 2, last_kind: 'reply' });
+    const id: string = list.threads[0].thread_id;
+
+    const { body: thread } = await get(b, `/local/threads/${id.slice(0, id.length - 28)}`);
+    expect(thread.thread).toMatchObject({ thread_id: id, origin: 'remote', session_id: `${b.name}-new-1` });
+    expect(thread.messages.map((m: any) => [m.direction, m.kind])).toEqual([
+      ['in', 'ask'],
+      ['out', 'reply'],
+    ]);
+    expect((await get(b, '/local/threads/nope')).status).toBe(404);
+
+    const { body: cursor } = await get(b, '/local/messages');
+    expect(cursor).toEqual({ messages: [], latest: thread.messages[1].seq });
+    const { body: after } = await get(b, `/local/messages?after=${thread.messages[0].seq}`);
+    expect(after.messages.map((m: any) => m.kind)).toEqual(['reply']);
+  });
+
   it('headless failure still answers the peer', async () => {
     const got = liveInbox(a, 'a-conn');
     b.runnerError = new Error('claude exited 1');

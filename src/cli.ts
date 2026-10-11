@@ -33,6 +33,7 @@ const HELP = `agent-bridge ${VERSION} — let Claude Code agents on different ma
   agent-bridge note <name>      print the note to paste into Claude Code again
   agent-bridge folders <name>   change which folders that person can read
   agent-bridge remove <name>    disconnect
+  agent-bridge log [thread] [-f] what the agents said to each other (-f: keep watching)
   agent-bridge status           check daemon, Tailscale and each connection
   agent-bridge uninstall        stop the daemon, remove the MCP server (keeps ~/.agent-bridge)
 `;
@@ -119,7 +120,8 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
   } catch {
     throw new Error('daemon is not running. Run: agent-bridge setup');
   }
-  const json = (await res.json()) as T & { error?: string };
+  const json = (await res.json().catch(() => ({}))) as T & { error?: string };
+  if (res.status === 404 && !json.error) throw new Error(`the running daemon is older than this CLI (${VERSION}). Restart it: agent-bridge setup`);
   if (!res.ok) throw new Error(json.error ?? `daemon responded ${res.status}`);
   return json;
 }
@@ -293,6 +295,80 @@ async function cmdPeers(): Promise<void> {
   }
 }
 
+interface ThreadView {
+  thread_id: string;
+  peer?: string;
+  origin?: 'local' | 'remote';
+  session_id?: string;
+  count: number;
+  last_at: number;
+  first_text: string;
+  last_kind: 'ask' | 'reply';
+}
+interface LogMessage {
+  seq: number;
+  thread_id: string;
+  direction: 'in' | 'out';
+  from: string;
+  kind: 'ask' | 'reply';
+  text: string;
+  received_at: number;
+}
+
+const UUID_LEN = 36;
+/** "<asker>-<uuid>" → "<asker>-<first 8 of uuid>", still a unique prefix for `agent-bridge log <thread>`. */
+const shortThread = (id: string) => (id.length > UUID_LEN ? id.slice(0, id.length - UUID_LEN + 8) : id);
+const stamp = (ms: number) => new Date(ms).toLocaleString('sv-SE', { hour12: false }).slice(5, 16);
+const firstLine = (text: string, max: number) => {
+  const line = text.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+};
+
+function printMessage(m: LogMessage, withThread: boolean): void {
+  const thread = withThread ? `  [${shortThread(m.thread_id)}]` : '';
+  console.log(`\n── ${stamp(m.received_at)} · ${m.from} · ${m.kind === 'ask' ? 'asks' : 'answers'}${thread} ──\n${m.text}`);
+}
+
+async function cmdLog(argv: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: { follow: { type: 'boolean', short: 'f' }, limit: { type: 'string', short: 'n' } },
+  });
+  const [threadArg] = positionals;
+
+  if (threadArg) {
+    const { thread, messages } = await api<{ thread: ThreadView; messages: LogMessage[] }>(`/local/threads/${encodeURIComponent(threadArg)}`);
+    const who = thread.origin === 'remote' ? `${thread.peer} asked you` : `you asked ${thread.peer ?? '?'}`;
+    console.log(`Thread ${thread.thread_id} — ${who}`);
+    for (const m of messages) printMessage(m, false);
+    if (thread.session_id) {
+      const role = thread.origin === 'remote' ? 'Answered on this machine by' : 'Asked from';
+      console.log(`\n${role} Claude Code session ${thread.session_id} — to see what it read and did:\n  claude --resume ${thread.session_id}`);
+    }
+  } else if (!values.follow) {
+    const { threads } = await api<{ threads: ThreadView[] }>(`/local/threads?limit=${Number(values.limit) || 20}`);
+    if (!threads.length) return console.log('No messages yet.');
+    for (const t of threads.reverse()) {
+      const who = t.origin === 'remote' ? `← ${t.peer} asked` : `→ asked ${t.peer ?? '?'}`;
+      const state = t.origin === 'local' && t.last_kind === 'ask' ? 'waiting' : `${t.count} msgs`;
+      console.log(`${stamp(t.last_at)}  ${shortThread(t.thread_id).padEnd(22)} ${who.padEnd(20)} ${state}\n    ${firstLine(t.first_text, 100)}`);
+    }
+    console.log('\nFull thread: agent-bridge log <thread>   ·   watch live: agent-bridge log -f');
+  }
+
+  if (values.follow) {
+    let { latest } = await api<{ latest: number }>('/local/messages');
+    console.log('Watching for new messages (Ctrl+C to stop)…');
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const res = await api<{ messages: LogMessage[]; latest: number }>(`/local/messages?after=${latest}`);
+      for (const m of res.messages) printMessage(m, true);
+      latest = res.latest;
+    }
+  }
+}
+
 async function cmdNote(argv: string[]): Promise<void> {
   const { peers } = await api<{ peers: PeerView[] }>('/local/peers');
   const p = peers.find((x) => x.name === argv[0]);
@@ -377,6 +453,8 @@ async function main(): Promise<void> {
       return cmdFolders(rest);
     case 'remove':
       return cmdRemove(rest);
+    case 'log':
+      return cmdLog(rest);
     case 'status':
       return cmdStatus();
     case 'uninstall':

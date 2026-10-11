@@ -12,6 +12,8 @@ export function buildClaudeArgs(opts) {
         args.push('--resume', opts.resumeSessionId);
     if (opts.resumeSessionId && opts.fork)
         args.push('--fork-session');
+    if (opts.name)
+        args.push('-n', opts.name);
     if (opts.model)
         args.push('--model', opts.model);
     if (opts.noTools)

@@ -45,6 +45,16 @@ Talk to Claude Code as usual: *"ask Cu's agent whether the orders table has a pr
 - **Regular sessions and the desktop app** work too. Claude polls `peer_inbox` for answers.
 - **When a colleague asks while you have no session open,** the daemon answers in a read-only session. If the question relates to one of your recent sessions (last 48h), it continues in that session.
 
+## See what the agents said
+
+Every message passes through both daemons, so **each side keeps the whole exchange on its own machine**. Nothing has to be shared between accounts (Claude Code cannot share a local session with another account anyway).
+
+- `agent-bridge log` lists recent threads: who asked whom, and the first line of each.
+- `agent-bridge log <thread>` prints the whole thread. When the answer came from your machine, it also prints `claude --resume <id>`, which opens the session that answered so you can see which files it read.
+- `agent-bridge log -f` shows new messages as they arrive.
+
+Sessions that answer a colleague are named `⇄ <colleague>: <question>`. Sessions started with `claude -p` are left out of the `/resume` picker, so open them by id. In the session that asked, the question and the answer appear as the `ask_peer` and `peer_inbox` tool calls.
+
 ## Permissions
 
 - For each connection, each side chooses which of its folders the other side may read. The other side can read **everything** in those folders, including any `.env` file.
@@ -61,6 +71,7 @@ agent-bridge peers           who is connected and what each side can read
 agent-bridge note <name>     print the Claude Code note again
 agent-bridge folders <name>  change which folders that person can read
 agent-bridge remove <name>   disconnect
+agent-bridge log [thread]    what the agents said to each other (-f: keep watching)
 agent-bridge status          daemon + each connection online/offline
 agent-bridge uninstall       stop the daemon, remove the MCP server
 ```

@@ -53,6 +53,34 @@ describe('BridgeStore', () => {
     expect(store.undeliveredReplies().map((m) => m.id)).toEqual(['r2']);
   });
 
+  it('keeps a readable log: threads newest first, a thread by id or unique prefix, and messages after a cursor', () => {
+    const remote = 'cu-1111aaaa-0000-4000-8000-000000000000';
+    const local = 'me-2222bbbb-0000-4000-8000-000000000000';
+    store.upsertThread({ thread_id: remote, origin: 'remote', peer: 'cu', session_id: 's1' });
+    store.insertMessage(msg({ id: 'q1', thread_id: remote, text: 'first question\nmore' }), 'in');
+    store.insertMessage(msg({ id: 'a1', thread_id: remote, from: 'me', kind: 'reply', text: 'answer' }), 'out');
+    store.upsertThread({ thread_id: local, origin: 'local', peer: 'cu', session_id: 's2' });
+    store.insertMessage(msg({ id: 'q2', thread_id: local, from: 'me', text: 'my question' }), 'out');
+
+    const threads = store.listThreads(10);
+    expect(threads.map((t) => t.thread_id)).toEqual([local, remote]);
+    expect(threads[1]).toMatchObject({ peer: 'cu', origin: 'remote', session_id: 's1', count: 2, first_text: 'first question\nmore', first_sender: 'cu', last_kind: 'reply' });
+    expect(store.listThreads(1)).toHaveLength(1);
+
+    expect(store.findThreadIds('cu-1111')).toEqual([remote]);
+    expect(store.findThreadIds(remote)).toEqual([remote]);
+    expect(store.findThreadIds('c')).toEqual([remote]);
+    expect(store.findThreadIds('%')).toEqual([]);
+
+    const log = store.threadMessages(remote);
+    expect(log.map((m) => [m.direction, m.kind, m.from])).toEqual([
+      ['in', 'ask', 'cu'],
+      ['out', 'reply', 'me'],
+    ]);
+    expect(store.messagesAfter(log[0].seq).map((m) => m.id)).toEqual(['a1', 'q2']);
+    expect(store.latestSeq()).toBe(store.messagesAfter(0).at(-1)?.seq);
+  });
+
   it('tracks outbox retries per peer', () => {
     store.enqueueOutbox(msg({ id: 'o1' }), 'cu', 'ECONNREFUSED');
     expect(store.outbox().map((o) => [o.message.id, o.peer])).toEqual([['o1', 'cu']]);
