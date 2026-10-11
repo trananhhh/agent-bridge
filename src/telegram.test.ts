@@ -154,6 +154,17 @@ describe('splitText', () => {
 });
 
 describe('channelsFromUpdates', () => {
+  it('also finds groups the bot joined or was mentioned in', () => {
+    const group = { id: -4001, title: 'TAP BOD', type: 'supergroup' };
+    expect(
+      channelsFromUpdates([
+        { my_chat_member: { chat: group, new_chat_member: { status: 'member' } } },
+        { message: { chat: group } },
+        { message: { chat: { id: 5, type: 'private' } } },
+      ]),
+    ).toEqual([{ id: -4001, title: 'TAP BOD' }]);
+  });
+
   it('finds channels the bot was made admin of, or that posted, once each', () => {
     const chat = { id: -1001, title: 'Bridge log', type: 'channel' };
     expect(

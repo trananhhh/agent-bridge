@@ -48,21 +48,28 @@ export function formatPosts(m, to) {
     const parts = splitText(m.text);
     return parts.map((p, i) => `${i === 0 ? header : `<i>(${i + 1}/${parts.length})</i>`}\n\n${escapeHtml(p)}`);
 }
-/** Channels where the bot was just made admin, or which posted something — how `agent-bridge telegram` finds the chat id. */
+const POSTABLE_STATUS = {
+    channel: ['administrator', 'creator'],
+    group: ['member', 'administrator', 'creator'],
+    supergroup: ['member', 'administrator', 'creator'],
+};
+/** Channels/groups the bot was just added to, or saw a post or mention in — how `agent-bridge telegram` finds the chat id. */
 export function channelsFromUpdates(updates) {
     const found = new Map();
     for (const u of updates) {
         const member = u.my_chat_member;
-        const post = u.channel_post;
-        const chat = member?.chat ?? post?.chat;
-        if (!chat || chat.type !== 'channel')
+        const chat = member?.chat ?? u.channel_post?.chat ?? u.message?.chat;
+        const allowed = chat?.type ? POSTABLE_STATUS[chat.type] : undefined;
+        if (!chat || !allowed)
             continue;
-        if (member && !['administrator', 'creator'].includes(member.new_chat_member?.status ?? ''))
+        if (member && !allowed.includes(member.new_chat_member?.status ?? ''))
             continue;
         found.set(chat.id, chat.title ?? String(chat.id));
     }
     return [...found].map(([id, title]) => ({ id, title }));
 }
+/** Whether a bot with this membership can post in a chat of this type. */
+export const canPost = (chatType, status, canPostMessages) => (POSTABLE_STATUS[chatType] ?? []).includes(status) && !(chatType === 'channel' && canPostMessages === false);
 /**
  * Read-only mirror of this machine's agent-bridge log into a Telegram channel.
  * Every message lands exactly once: its sender posts it, unless the sender has no mirror to this chat, in which case the receiver does.

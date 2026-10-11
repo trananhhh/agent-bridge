@@ -11,7 +11,7 @@ import { findBridges, parseTailscaleStatus } from "./discovery.js";
 import { IS_WIN, claudeInvocation, copyToClipboard, findClaude, installService, openUrl, serviceInstalled, uninstallService } from "./platform.js";
 import { shortThreadId } from "./protocol.js";
 import { tailscaleStatus, tailscaleWhois } from "./tailscale.js";
-import { channelsFromUpdates, telegramCall } from "./telegram.js";
+import { canPost, channelsFromUpdates, telegramCall } from "./telegram.js";
 const CLI_PATH = fileURLToPath(import.meta.url);
 const LOG_PATH = join(BRIDGE_HOME, 'daemon.log');
 const INSTALL_CMD = 'npm install -g --prefer-online https://github.com/trananhhh/agent-bridge/tarball/main';
@@ -382,20 +382,24 @@ async function cmdStatus() {
 }
 const BOTFATHER_URL = 'https://t.me/BotFather';
 const addToChannelUrl = (bot) => `https://t.me/${bot}?startchannel&admin=post_messages`;
+const addToGroupUrl = (bot) => `https://t.me/${bot}?startgroup&admin=post_messages`;
 /** Resolves "@name" or "-100…" to the numeric id both sides compare, and checks the bot may post there. */
 async function resolveChannel(token, botId, chat) {
     const info = await telegramCall(token, 'getChat', { chat_id: /^-?\d+$/.test(chat) ? Number(chat) : chat });
     const member = await telegramCall(token, 'getChatMember', { chat_id: info.id, user_id: botId });
-    if (member.status !== 'administrator' || member.can_post_messages === false)
-        throw new Error(`the bot is not an admin that can post in "${info.title ?? chat}"`);
+    if (!canPost(info.type, member.status, member.can_post_messages)) {
+        throw new Error(`the bot cannot post in "${info.title ?? chat}" (${info.type}, ${member.status}) — a channel needs it as an admin`);
+    }
     return { id: info.id, title: info.title ?? String(info.id) };
 }
 async function detectChannel(token, bot) {
-    const poll = async (timeout) => channelsFromUpdates(await telegramCall(token, 'getUpdates', { timeout, allowed_updates: ['my_chat_member', 'channel_post'] }));
+    const poll = async (timeout) => channelsFromUpdates(await telegramCall(token, 'getUpdates', { timeout, allowed_updates: ['my_chat_member', 'channel_post', 'message'] }));
     let channels = await poll(0);
     if (!channels.length) {
         const link = addToChannelUrl(bot);
-        console.log(`\nTap this link, then pick your channel (or create one) and confirm — it adds @${bot} as an admin:\n  ${link}`);
+        console.log(`\nTap this link, pick your channel (or create one) and confirm — it adds @${bot} as an admin that can post:\n  ${link}`);
+        console.log(`Using a group instead? ${addToGroupUrl(bot)}`);
+        console.log(`Bot already in there? Post "@${bot} hi" in that chat.`);
         openUrl(link);
         console.log('Waiting up to 4 minutes…');
         for (let i = 0; i < 48 && !channels.length; i++)

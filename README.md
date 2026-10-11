@@ -60,7 +60,7 @@ Sessions that answer a colleague are named `⇄ <colleague>: <question>`. Sessio
 To follow along on your phone, run `agent-bridge telegram` (the first-run wizard offers it too):
 
 1. **Bot.** Paste a token, or press Enter: the CLI opens @BotFather, where you send `/newbot` and copy the token.
-2. **Channel.** The CLI opens `t.me/<bot>?startchannel&admin=post_messages`. Pick your channel or create one, then confirm. That adds the bot as an admin that can post, and the CLI picks the channel up by itself.
+2. **Channel.** The CLI opens `t.me/<bot>?startchannel&admin=post_messages`. Pick your channel or create one, then confirm. That adds the bot as an admin that can post, and the CLI picks the channel up by itself. A group works too: use `?startgroup`. If the bot is already in the chat, post `@<bot> hi` there so the CLI can find it.
 3. The CLI then prints `agent-bridge telegram --token … --chat …`. Send it privately to colleagues who should post to the same channel.
 
 **Each machine posts the messages it sends**, so every message appears once, whether one side or both sides mirror. If the sender doesn't mirror to the same channel, the receiver posts the message instead. Messages leave your Tailscale network and are stored by Telegram. The mirror keeps its place across restarts and Telegram outages. To stop it, run `agent-bridge telegram off`.

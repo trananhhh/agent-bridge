@@ -69,19 +69,29 @@ export function formatPosts(m: LoggedMessage, to: string): string[] {
 
 export type TelegramUpdate = Record<string, { chat?: { id: number; title?: string; type?: string }; new_chat_member?: { status?: string } } | undefined>;
 
-/** Channels where the bot was just made admin, or which posted something — how `agent-bridge telegram` finds the chat id. */
+const POSTABLE_STATUS: Record<string, string[]> = {
+  channel: ['administrator', 'creator'],
+  group: ['member', 'administrator', 'creator'],
+  supergroup: ['member', 'administrator', 'creator'],
+};
+
+/** Channels/groups the bot was just added to, or saw a post or mention in — how `agent-bridge telegram` finds the chat id. */
 export function channelsFromUpdates(updates: TelegramUpdate[]): { id: number; title: string }[] {
   const found = new Map<number, string>();
   for (const u of updates) {
     const member = u.my_chat_member;
-    const post = u.channel_post;
-    const chat = member?.chat ?? post?.chat;
-    if (!chat || chat.type !== 'channel') continue;
-    if (member && !['administrator', 'creator'].includes(member.new_chat_member?.status ?? '')) continue;
+    const chat = member?.chat ?? u.channel_post?.chat ?? u.message?.chat;
+    const allowed = chat?.type ? POSTABLE_STATUS[chat.type] : undefined;
+    if (!chat || !allowed) continue;
+    if (member && !allowed.includes(member.new_chat_member?.status ?? '')) continue;
     found.set(chat.id, chat.title ?? String(chat.id));
   }
   return [...found].map(([id, title]) => ({ id, title }));
 }
+
+/** Whether a bot with this membership can post in a chat of this type. */
+export const canPost = (chatType: string, status: string, canPostMessages?: boolean) =>
+  (POSTABLE_STATUS[chatType] ?? []).includes(status) && !(chatType === 'channel' && canPostMessages === false);
 
 export interface TelegramMirror {
   /** Posts every message stored since the last successful post. Safe to call often; concurrent calls no-op. */
