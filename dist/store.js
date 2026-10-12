@@ -67,6 +67,11 @@ export class BridgeStore {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS drafts_thread ON drafts (thread_id, status);
+      CREATE TABLE IF NOT EXISTS telegram_owners (
+        tg_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        machine TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -81,6 +86,15 @@ export class BridgeStore {
             this.db.exec('ALTER TABLE messages ADD COLUMN mirror TEXT');
         if (!columns.includes('via'))
             this.db.exec('ALTER TABLE messages ADD COLUMN via TEXT');
+        const draftColumns = this.db.prepare('PRAGMA table_info(drafts)').all().map((c) => c.name);
+        if (!draftColumns.includes('session_id')) {
+            // 0.7.0 drafts were answers posted privately with buttons; they mean nothing to this version and their post ids belong to another chat.
+            this.db.exec("UPDATE drafts SET status = 'superseded', shown_status = 'superseded', posted_message_id = -1");
+        }
+        for (const column of ['session_id', 'cwd', 'answer']) {
+            if (!draftColumns.includes(column))
+                this.db.exec(`ALTER TABLE drafts ADD COLUMN ${column} TEXT`);
+        }
     }
     insertMessage(m, direction, via) {
         const res = this.db
@@ -95,8 +109,8 @@ export class BridgeStore {
     }
     insertDraft(d) {
         this.db
-            .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)`)
-            .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, Date.now());
+            .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, session_id, cwd, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+            .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, d.session_id ?? null, d.cwd ?? null, Date.now());
     }
     getDraft(id) {
         const row = this.db.prepare('SELECT * FROM drafts WHERE id = ?').get(id);
@@ -112,9 +126,9 @@ export class BridgeStore {
         const row = this.db.prepare('SELECT * FROM drafts WHERE posted_message_id = ?').get(messageId);
         return row ? toDraft(row) : undefined;
     }
-    /** Moves a pending draft to `status`. False when it was no longer pending, so two clicks never send twice. */
-    resolveDraft(id, status, by) {
-        return Number(this.db.prepare("UPDATE drafts SET status = ?, resolved_by = ? WHERE id = ? AND status = 'pending'").run(status, by, id).changes) > 0;
+    /** Moves a pending draft to `status`. False when it was no longer pending, so one answer is never acted on twice. */
+    resolveDraft(id, status, by, answer) {
+        return (Number(this.db.prepare("UPDATE drafts SET status = ?, resolved_by = ?, answer = ? WHERE id = ? AND status = 'pending'").run(status, by, answer ?? null, id).changes) > 0);
     }
     /** Settles every pending draft on a thread; returns their ids. */
     settlePendingDrafts(threadId, status, by) {
@@ -123,8 +137,16 @@ export class BridgeStore {
             this.resolveDraft(id, status, by);
         return ids;
     }
+    /** The session finished replying to the owner's answer. */
+    finishDraft(id) {
+        this.db.prepare("UPDATE drafts SET status = 'answered' WHERE id = ? AND status = 'answering'").run(id);
+    }
+    /** Owner answers whose reply was still being written when the daemon stopped. */
+    draftsAnswering() {
+        return this.db.prepare("SELECT * FROM drafts WHERE status = 'answering' ORDER BY created_at, rowid").all().map(toDraft);
+    }
     reopenDraft(id) {
-        this.db.prepare("UPDATE drafts SET status = 'pending', resolved_by = NULL WHERE id = ?").run(id);
+        this.db.prepare("UPDATE drafts SET status = 'pending', resolved_by = NULL, answer = NULL WHERE id = ?").run(id);
     }
     threadDrafts(threadId) {
         return this.db.prepare('SELECT * FROM drafts WHERE thread_id = ? ORDER BY created_at, rowid').all(threadId).map(toDraft);
@@ -310,6 +332,27 @@ export class BridgeStore {
             .prepare('UPDATE requests SET status = ?, remote_folders = COALESCE(?, remote_folders) WHERE id = ?')
             .run(status, remoteFolders ? JSON.stringify(remoteFolders) : null, id);
     }
+    setTelegramOwner(o) {
+        this.db
+            .prepare('INSERT INTO telegram_owners (tg_id, name, machine) VALUES (?, ?, ?) ON CONFLICT (tg_id) DO UPDATE SET name = excluded.name, machine = excluded.machine')
+            .run(o.id, o.name, o.machine);
+    }
+    telegramOwner(id) {
+        const row = this.db.prepare('SELECT * FROM telegram_owners WHERE tg_id = ?').get(id);
+        return row ? toOwner(row) : undefined;
+    }
+    telegramOwners(machine) {
+        const rows = (machine
+            ? this.db.prepare('SELECT * FROM telegram_owners WHERE machine = ? ORDER BY tg_id').all(machine)
+            : this.db.prepare('SELECT * FROM telegram_owners ORDER BY tg_id').all());
+        return rows.map(toOwner);
+    }
+    /** A machine's owners as its hub last reported them. */
+    replaceTelegramOwners(machine, owners) {
+        this.db.prepare('DELETE FROM telegram_owners WHERE machine = ?').run(machine);
+        for (const o of owners)
+            this.setTelegramOwner({ ...o, machine });
+    }
     getKv(key) {
         const row = this.db.prepare('SELECT value FROM kv WHERE key = ?').get(key);
         return row ? String(row.value) : undefined;
@@ -352,6 +395,9 @@ function toLogged(r) {
         m.via = r.via;
     return m;
 }
+function toOwner(r) {
+    return { id: Number(r.tg_id), name: String(r.name), machine: String(r.machine) };
+}
 function toDraft(r) {
     const d = {
         id: String(r.id),
@@ -365,6 +411,12 @@ function toDraft(r) {
         d.question = String(r.question);
     if (r.resolved_by !== null)
         d.resolved_by = String(r.resolved_by);
+    if (r.session_id)
+        d.session_id = String(r.session_id);
+    if (r.cwd)
+        d.cwd = String(r.cwd);
+    if (r.answer !== null && r.answer !== undefined)
+        d.answer = String(r.answer);
     if (r.posted_message_id !== null)
         d.posted_message_id = Number(r.posted_message_id);
     if (r.shown_status !== null)

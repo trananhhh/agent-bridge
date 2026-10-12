@@ -179,3 +179,28 @@ export function uninstallService(bridgeHome) {
 export function serviceInstalled() {
     return (IS_MAC && existsSync(LAUNCHD_PLIST)) || (IS_WIN && existsSync(WIN_STARTUP_VBS));
 }
+/** npm's own script, next to this node (Windows layout) or in its lib folder (Unix layout). */
+function npmCli() {
+    const bin = dirname(process.execPath);
+    return [join(bin, 'node_modules', 'npm', 'bin', 'npm-cli.js'), join(bin, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')].find((p) => existsSync(p));
+}
+/**
+ * Installs (or updates) a global npm package with the npm that belongs to this node, whatever PATH the service has.
+ * Runs npm's script with node directly: no shell, so paths with spaces (C:\Program Files\nodejs) are fine.
+ */
+export function installGlobalPackage(url) {
+    const cli = npmCli();
+    const args = ['install', '-g', '--prefer-online', url];
+    const [command, argv, shell] = cli ? [process.execPath, [cli, ...args], false] : [IS_WIN ? 'npm.cmd' : 'npm', args, IS_WIN];
+    return new Promise((resolve, reject) => {
+        execFile(command, argv, { timeout: 5 * 60_000, shell }, (err, _stdout, stderr) => err ? reject(new Error(String(stderr).trim().split('\n').at(-1) || err.message)) : resolve());
+    });
+}
+/**
+ * Starts the service again after this process exits. launchd does it by itself (KeepAlive);
+ * the Windows Startup launcher only runs at login, so run it now — call this once the ports are closed.
+ */
+export function relaunchService() {
+    if (IS_WIN && existsSync(WIN_STARTUP_VBS))
+        spawn('wscript.exe', [WIN_STARTUP_VBS], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+}

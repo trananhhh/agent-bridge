@@ -86,59 +86,40 @@ export function formatPosts(m: LoggedMessage, to: string): Post[] {
   );
 }
 
-const OVERTAKEN = 'You answered first; the agent had also written this.';
-const REPLY_HINT = 'Reply to this message to answer in your own words.';
-
-/** What the shared chat sees of a held answer: that one is waiting — never its content or the question to the owner. */
-export function formatHeldNotice(d: Draft, self: string, owners: string): Post[] {
-  const code = shortThreadId(d.thread_id);
-  return [
-    {
-      html: `🙋 <b>${escapeHtml(self)} → ${escapeHtml(d.peer)}</b>: an answer is waiting for ${escapeHtml(owners)} to check  <code>${escapeHtml(code)}</code>`,
-      plain: `🙋 ${self} → ${d.peer}: an answer is waiting for ${owners} to check  ${code}`,
-    },
-  ];
-}
-
-export function formatDraft(d: Draft, self: string, owners: string): Post[] {
-  const code = shortThreadId(d.thread_id);
-  const note = d.question ?? OVERTAKEN;
-  const head = {
-    html: `<b>🙋 For ${escapeHtml(owners)} to check</b> · ${escapeHtml(self)} → ${escapeHtml(d.peer)}  <code>${escapeHtml(code)}</code>\n<i>${escapeHtml(note)}</i>`,
-    plain: `🙋 For ${owners} to check · ${self} → ${d.peer}  ${code}\n${note}`,
-  };
-  const parts = withHeader(head, d.text || '—', code);
-  const last = parts.at(-1)!;
-  parts[parts.length - 1] = { html: `${last.html}\n\n<i>${REPLY_HINT}</i>`, plain: `${last.plain}\n\n${REPLY_HINT}` };
-  return parts;
-}
-
-function unshowable(d: Draft, owners: string): Post {
-  const text = `🙋 An answer is waiting for ${owners} to check, but Telegram could not show it. Read it with: agent-bridge log ${shortThreadId(d.thread_id)}`;
-  return { html: escapeHtml(text), plain: text };
-}
-
-type Keyboard = { inline_keyboard: { text: string; callback_data: string }[][] };
-
-const draftButtons = (d: Draft): Keyboard => ({
-  inline_keyboard: [
-    [
-      ...(d.text ? [{ text: '✅ Send', callback_data: `d:${d.id}:send` }] : []),
-      { text: "🚫 Don't send", callback_data: `d:${d.id}:drop` },
-    ],
-  ],
-});
-
-const OUTCOME: Record<Exclude<DraftStatus, 'pending'>, (by: string) => string> = {
-  sent: (by) => `✅ Sent by ${by}`,
-  dropped: (by) => `🚫 Not sent (${by})`,
-  replaced: (by) => `✍️ ${by} answered instead`,
-  superseded: () => '↪️ Replaced by a newer draft',
+const OUTCOME: Partial<Record<DraftStatus, (by: string) => string>> = {
+  answering: (by) => `⏳ ${by} answered — the reply is being written`,
+  answered: (by) => `✅ Answered by ${by}`,
+  superseded: () => '↪️ Replaced by a newer question',
 };
 
-const outcomeButton = (d: Draft): Keyboard => ({
-  inline_keyboard: [[{ text: d.status === 'pending' ? '…' : OUTCOME[d.status](d.resolved_by ?? '?'), callback_data: 'noop' }]],
-});
+/** The agent's question to its owner, and how to answer it: reply here, or continue the session in Claude. */
+export function formatQuestion(d: Draft, self: string, owners: string): Post {
+  const code = shortThreadId(d.thread_id);
+  // Run on this machine, so in this machine's shell (PowerShell 5 has no &&).
+  const resume = d.session_id ? `${d.cwd ? `cd "${d.cwd}"${process.platform === 'win32' ? ';' : ' &&'} ` : ''}claude --resume ${d.session_id}` : undefined;
+  const question = d.question ?? '';
+  const status = OUTCOME[d.status]?.(d.resolved_by ?? '?');
+  return {
+    html: [
+      `🙋 <b>${escapeHtml(self)} asks ${escapeHtml(owners)}</b>  <code>${escapeHtml(code)}</code>`,
+      `Before answering ${escapeHtml(d.peer)}:`,
+      `${markdownToTelegramHtml(question)}`,
+      '',
+      resume
+        ? `<i>Reply to this message to answer, or continue in Claude:</i> <code>${escapeHtml(resume)}</code>`
+        : '<i>Reply to this message to answer.</i>',
+      ...(status ? ['', status] : []),
+    ].join('\n'),
+    plain: [
+      `🙋 ${self} asks ${owners}  ${code}`,
+      `Before answering ${d.peer}:`,
+      question,
+      '',
+      resume ? `Reply to this message to answer, or continue in Claude: ${resume}` : 'Reply to this message to answer.',
+      ...(status ? ['', status] : []),
+    ].join('\n'),
+  };
+}
 
 interface ChatEvent {
   chat?: { id: number; title?: string; type?: string };
@@ -156,18 +137,6 @@ export interface TelegramUpdate {
 
 /** The offset that confirms these updates, so the next poll returns only newer ones. */
 export const nextOffset = (updates: TelegramUpdate[], current = 0) => Math.max(current, ...updates.map((u) => (u.update_id ?? -1) + 1));
-
-/**
- * Who opened the setup link `t.me/<bot>?start=<code>`: a private "/start <code>" carrying the code printed in the terminal.
- * Only someone at this machine has the code, and opening the private chat lets the bot send them held answers.
- */
-export function findStart(updates: TelegramUpdate[], code: string): { id: number; name: string } | undefined {
-  for (const { message: m } of updates) {
-    if (m?.chat?.type !== 'private' || !m.from || m.from.is_bot || m.text?.trim() !== `/start ${code}`) continue;
-    return { id: m.from.id, name: [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || String(m.from.id) };
-  }
-  return undefined;
-}
 
 const POSTABLE_STATUS: Record<string, string[]> = {
   channel: ['administrator', 'creator'],
@@ -208,10 +177,8 @@ export function createTelegramMirror(opts: {
   store: BridgeStore;
   selfName: string;
   target: TelegramTarget;
-  /** Who checks held answers, as shown on them. */
-  owners?: string;
-  /** The owner's private chat with the bot: held answers go there, since the other side reads the shared chat. */
-  reviewChat?: number;
+  /** Who the agent's questions are for, as shown on them. */
+  owners?: () => string | undefined;
   fetchImpl?: Fetch;
   log: (event: string, data?: Record<string, unknown>) => void;
   now?: () => number;
@@ -222,7 +189,6 @@ export function createTelegramMirror(opts: {
   let running = false;
   let pausedUntil = 0;
   let lastError: string | undefined;
-  const reviewChat = opts.reviewChat ?? target.chatId;
   const call = <T>(method: string, body: Record<string, unknown>) =>
     telegramCall<T>(target.botToken, method, { chat_id: target.chatId, ...body }, opts.fetchImpl);
 
@@ -277,21 +243,20 @@ export function createTelegramMirror(opts: {
     }
   };
 
-  const postDrafts = async (): Promise<boolean> => {
-    const owners = opts.owners ?? 'the owner';
+  const postQuestions = async (): Promise<boolean> => {
+    const owners = opts.owners?.() || 'the owner';
     for (const d of store.unpostedDrafts()) {
-      const where = { chat: reviewChat, lastExtra: { reply_markup: draftButtons(d) } };
       let posted = 0;
-      if (!(await attempt(d.id, async () => void (posted = await sendAll(formatDraft(d, opts.selfName, owners), where))))) return false;
-      // Telegram refused to show it: the owner can still decide, and read it with `agent-bridge log`.
-      if (!posted && !(await attempt(d.id, async () => void (posted = await sendAll([unshowable(d, owners)], where))))) return false;
+      // A question replaced before it went out is never posted (0 marks it done).
+      if (d.status === 'pending' && !(await attempt(d.id, async () => void (posted = await sendAll([formatQuestion(d, opts.selfName, owners)]))))) return false;
       store.setDraftPosted(d.id, posted);
-      if (reviewChat !== target.chatId && !(await attempt(d.id, async () => void (await sendAll(formatHeldNotice(d, opts.selfName, owners)))))) return false;
+      if (!posted) store.setDraftShown(d.id, d.status);
     }
     for (const d of store.draftsToRefresh()) {
+      const q = formatQuestion(d, opts.selfName, owners);
       const ok = await attempt(d.id, async () => {
         try {
-          await call('editMessageReplyMarkup', { chat_id: reviewChat, message_id: d.posted_message_id, reply_markup: outcomeButton(d) });
+          await call('editMessageText', { message_id: d.posted_message_id, text: q.html, parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
         } catch (err) {
           // Already showing it, or the post is gone: nothing left to update.
           if (!(err instanceof TelegramError && err.status === 400)) throw err;
@@ -307,7 +272,7 @@ export function createTelegramMirror(opts: {
     if (running || now() < pausedUntil) return;
     running = true;
     try {
-      if (await postMessages()) await postDrafts();
+      if (await postMessages()) await postQuestions();
     } finally {
       running = false;
     }

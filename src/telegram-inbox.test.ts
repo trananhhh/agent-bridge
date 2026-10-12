@@ -2,193 +2,280 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BridgeStore } from './store.ts';
-import { createTelegramInbox } from './telegram-inbox.ts';
+import { Hono } from 'hono';
+import { BridgeStore, type PeerRecord } from './store.ts';
+import { createTelegramInbox, type TelegramSettings } from './telegram-inbox.ts';
 import { fakeTelegram } from './test-support/fake-telegram.ts';
-import type { DraftOutcome, OwnerActions, OwnerReplyInput } from './daemon.ts';
+import type { AnswerOutcome, OwnerActions, OwnerReplyInput } from './daemon.ts';
 
 const THREAD = 'cu-35c42200-8133-42d7-a7a9-6e7204d05aa0';
 const CHAT = -1001;
-const OWNER = { id: 42, name: 'Anh' };
-const BOT = { id: 7, is_bot: true, first_name: 'bridge' };
+const ANH = { id: 42, is_bot: false, first_name: 'Trần', last_name: 'Anh' };
+const CU = { id: 7, is_bot: false, first_name: 'Cừ' };
+const BOT = { id: 5, is_bot: true, first_name: 'bridge' };
+const TOKEN = '123:secret';
 
 const bridgePost = (messageId: number, code = 'cu-35c42200') => {
   const text = `❓ cu → anh  ${code}\n\nquestion`;
   return { message_id: messageId, from: BOT, chat: { id: CHAT }, text, entities: [{ type: 'code', offset: text.indexOf(code), length: code.length }] };
 };
 
+interface Machine {
+  name: string;
+  store: BridgeStore;
+  settings: TelegramSettings | undefined;
+  replies: OwnerReplyInput[];
+  answers: [string, string, string][];
+  outcome: AnswerOutcome;
+  peerApp: Hono;
+  localApp: Hono;
+  inbox: ReturnType<typeof createTelegramInbox>;
+}
+
 describe('telegram inbox', () => {
   let dir: string;
-  let store: BridgeStore;
   let tg: ReturnType<typeof fakeTelegram>;
   let logs: string[];
-  let replies: OwnerReplyInput[];
-  let decisions: [string, string, string][];
-  let outcome: DraftOutcome;
-  let actionsRun: number;
   let updateId = 0;
+  let messageId = 500;
+  const machines = new Map<string, Machine>();
+  const peerCalls: string[] = [];
 
-  let actions: OwnerActions;
-  const makeActions = (): OwnerActions => ({
-    ownerReply: async (input) => {
-      replies.push(input);
-      return { id: 'm', thread_id: input.threadId, to: 'cu', status: 'sent' };
-    },
-    resolveDraft: async (id, action, owner) => {
-      decisions.push([id, action, owner]);
-      return outcome;
-    },
-  });
-  const inbox = () =>
-    createTelegramInbox({
+  /** Telegram calls go to the fake; peer calls go to that machine's peer app. */
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (String(url).startsWith('https://api.telegram.org/')) return tg.fetchImpl(url, init);
+    const target = machines.get(new URL(url).hostname.replace(/\.test$/, ''));
+    peerCalls.push(`${new URL(url).hostname} ${new URL(url).pathname}`);
+    if (!target) throw new Error('ECONNREFUSED');
+    return target.peerApp.request(new URL(url).pathname, init);
+  }) as typeof fetch;
+
+  function addMachine(name: string, settings: TelegramSettings | undefined, peers: string[]): Machine {
+    const store = new BridgeStore(join(dir, `${name}.db`));
+    store.setKv('telegram_update_offset', '0');
+    for (const p of peers) store.upsertPeer({ name: p, url: `http://${p}.test`, token: `tok-${[name, p].sort().join('-')}`, folders: ['/w'], remoteFolders: [] });
+    const m = { name, store, settings, replies: [], answers: [], outcome: 'answered', peerApp: new Hono(), localApp: new Hono() } as unknown as Machine;
+    const actions: OwnerActions = {
+      ownerReply: async (input) => {
+        m.replies.push(input);
+        return { id: 'x', thread_id: input.threadId, to: 'cu', status: 'sent' };
+      },
+      answerOwnerQuestion: async (id, text, owner) => {
+        m.answers.push([id, text, owner]);
+        return m.outcome;
+      },
+    };
+    m.inbox = createTelegramInbox({
       store,
-      target: { botToken: '123:secret', chatId: CHAT },
-      owners: [OWNER],
+      selfName: name,
+      settings: () => m.settings,
       actions,
-      fetchImpl: tg.fetchImpl,
+      authenticate: (header) => store.listPeers().find((p: PeerRecord) => header === `Bearer ${p.token}`),
+      fetchImpl,
       log: (event) => logs.push(event),
-      afterAction: () => actionsRun++,
     });
+    m.inbox.mount(m.peerApp, m.localApp);
+    machines.set(name, m);
+    return m;
+  }
+
   const deliver = (...updates: Record<string, unknown>[]) => tg.respond(updates.map((u) => ({ update_id: ++updateId, ...u })));
-  const ownerMessage = (over: Record<string, unknown>) => ({
-    message: { message_id: 500 + updateId, from: { id: OWNER.id, is_bot: false, first_name: 'Anh' }, chat: { id: CHAT }, text: 'Đúng rồi', ...over },
+  const say = (from: { id: number; is_bot: boolean; first_name: string; last_name?: string }, over: Record<string, unknown>) => ({
+    message: { message_id: ++messageId, from, chat: { id: CHAT, type: 'group' }, text: 'Đúng rồi', ...over },
   });
   const calls = (method: string) => tg.sent.filter((s) => s.method === method).map((s) => s.body);
+  const post = (app: Hono, path: string, body: unknown, token?: string) =>
+    app.request(path, { method: 'POST', headers: token ? { authorization: `Bearer ${token}` } : {}, body: JSON.stringify(body) });
+
+  let hub: Machine;
+  let member: Machine;
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'bridge-inbox-'));
-    store = new BridgeStore(join(dir, 'bridge.db'));
-    store.insertMessage({ id: 'q', thread_id: THREAD, from: 'cu', kind: 'ask', text: 'q', sent_at: 'now' }, 'in');
-    store.setKv('telegram_update_offset', '0');
     tg = fakeTelegram();
     logs = [];
-    replies = [];
-    decisions = [];
-    outcome = 'sent';
-    actionsRun = 0;
-    actions = makeActions();
+    peerCalls.length = 0;
+    machines.clear();
+    hub = addMachine('anh', { botToken: TOKEN, chatId: CHAT, chatTitle: 'TAP BOD' }, ['cu']);
+    member = addMachine('cu', { botToken: TOKEN, chatId: CHAT, chatTitle: 'TAP BOD', hub: 'anh' }, ['anh']);
+    for (const m of [hub, member]) m.store.insertMessage({ id: 'q', thread_id: THREAD, from: 'cu', kind: 'ask', text: 'q', sent_at: 'now' }, m.name === 'anh' ? 'in' : 'out');
+    hub.store.setTelegramOwner({ id: ANH.id, name: 'Trần Anh', machine: 'anh' });
   });
   afterEach(() => {
-    store.close();
+    for (const m of machines.values()) m.store.close();
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("sends the owner's reply to a bridge post — by either side's bot — into that post's thread, and marks it 👍", async () => {
-    deliver(ownerMessage({ reply_to_message: bridgePost(90) }));
-    expect(await inbox().pollOnce(0)).toBe(0);
-    expect(replies).toEqual([{ threadId: THREAD, text: 'Đúng rồi', owner: 'Anh', seenInChat: true }]);
-    expect(calls('setMessageReaction')).toEqual([{ chat_id: CHAT, message_id: 500, reaction: [{ type: 'emoji', emoji: '👍' }] }]);
-    expect(actionsRun).toBe(1);
+  describe('acting for this machine', () => {
+    it("sends the owner's reply to a bridge post — by either side — into that post's thread, and marks it 👍", async () => {
+      deliver(say(ANH, { reply_to_message: bridgePost(90) }));
+      expect(await hub.inbox.pollOnce(0)).toBe(0);
+      expect(hub.replies).toEqual([{ threadId: THREAD, text: 'Đúng rồi', owner: 'Trần Anh', seenInChat: true }]);
+      expect(calls('setMessageReaction')).toEqual([{ chat_id: CHAT, message_id: messageId, reaction: [{ type: 'emoji', emoji: '👍' }] }]);
+    });
+
+    it("answers the agent's question when the owner replies to its notification", async () => {
+      hub.store.insertDraft({ id: 'q1', thread_id: THREAD, peer: 'cu', question: 'ok?', text: 'x', session_id: 's' });
+      hub.store.setDraftPosted('q1', 91);
+      deliver(say(ANH, { reply_to_message: { message_id: 91, from: BOT, chat: { id: CHAT }, text: '🙋 anh needs Trần Anh' } }));
+      await hub.inbox.pollOnce(0);
+      expect(hub.answers).toEqual([['q1', 'Đúng rồi', 'Trần Anh']]);
+      expect(hub.replies).toEqual([]);
+      expect(calls('setMessageReaction')).toHaveLength(1);
+
+      hub.outcome = 'already answered';
+      deliver(say(ANH, { reply_to_message: { message_id: 91, from: BOT, chat: { id: CHAT }, text: '🙋' } }));
+      await hub.inbox.pollOnce(0);
+      expect(String(calls('sendMessage').at(-1)?.text)).toMatch(/already answered/);
+    });
+
+    it('finds a plain-text post by the thread id in its text', async () => {
+      deliver(say(ANH, { reply_to_message: { message_id: 92, from: BOT, chat: { id: CHAT }, text: '💬 anh → cu  cu-35c42200\n\nanswer' } }));
+      await hub.inbox.pollOnce(0);
+      expect(hub.replies.map((r) => r.threadId)).toEqual([THREAD]);
+    });
+
+    it('ignores strangers, other chats, non-replies, replies to people, unknown threads and non-text', async () => {
+      deliver(
+        say({ id: 99, is_bot: false, first_name: 'X' }, { reply_to_message: bridgePost(90) }),
+        say(ANH, { chat: { id: -2002, type: 'group' }, reply_to_message: bridgePost(90) }),
+        say(ANH, {}),
+        say(ANH, { reply_to_message: { ...bridgePost(90), from: { id: 99, is_bot: false } } }),
+        say(ANH, { reply_to_message: bridgePost(90, 'cu-ffffffff') }),
+        say(ANH, { text: undefined, photo: [{}], reply_to_message: bridgePost(90) }),
+      );
+      await hub.inbox.pollOnce(0);
+      expect(hub.replies).toEqual([]);
+      expect(calls('setMessageReaction')).toEqual([]);
+    });
   });
 
-  it('takes a reply to a held answer in the private chat for that answer, and finds a plain-text post by the id in its text', async () => {
-    store.insertDraft({ id: 'd1', thread_id: THREAD, peer: 'cu', question: 'ok?', text: 'x' });
-    store.setDraftPosted('d1', 91);
-    const dm = { id: OWNER.id, type: 'private' };
-    deliver(
-      ownerMessage({ chat: dm, reply_to_message: { message_id: 91, from: BOT, chat: dm, text: 'whatever' } }),
-      ownerMessage({ reply_to_message: { message_id: 92, from: BOT, chat: { id: CHAT }, text: '💬 anh → cu  cu-35c42200\n\nanswer' } }),
-    );
-    await inbox().pollOnce(0);
-    expect(replies.map((r) => [r.threadId, r.seenInChat])).toEqual([
-      [THREAD, false],
-      [THREAD, true],
-    ]);
+  describe('one shared bot: the hub reads it for everyone', () => {
+    it("registers whoever opens a machine's one-time link as that machine's owner", async () => {
+      tg.respond({ id: 5, username: 'test_bot' });
+      const res = await post(hub.localApp, '/local/telegram/claim', {});
+      const { code, bot } = (await res.json()) as { code: string; bot: string };
+      expect(bot).toBe('test_bot');
+      deliver(
+        { message: { message_id: 1, from: { id: 43, first_name: 'Lan' }, chat: { id: 43, type: 'private' }, text: '/start wrong' } },
+        { message: { message_id: 2, from: { id: 44, first_name: 'Minh' }, chat: { id: 44, type: 'private' }, text: `/start ${code}` } },
+      );
+      await hub.inbox.pollOnce(0);
+      expect(hub.store.telegramOwners('anh').map((o) => o.name)).toEqual(['Trần Anh', 'Minh']);
+      expect(hub.store.telegramOwner(43)).toBeUndefined();
+      expect(calls('sendMessage').map((m) => [m.chat_id, String(m.text).slice(0, 2)])).toEqual([
+        [43, '⚠️'],
+        [44, '✓ '],
+      ]);
+      const listed = (await (await hub.localApp.request('/local/telegram/owners')).json()) as { owners: unknown[] };
+      expect(listed.owners).toHaveLength(2);
+    });
+
+    it('lets a connected machine join: it gets the bot and a link, and its owner is registered for it and reported back to it', async () => {
+      tg.respond({ id: 5, username: 'test_bot' });
+      const res = await post(member.localApp, '/local/telegram/claim', { hub: 'anh' });
+      expect(res.status).toBe(200);
+      const joined = (await res.json()) as Record<string, string | number>;
+      expect(joined).toMatchObject({ botToken: TOKEN, chatId: CHAT, chatTitle: 'TAP BOD', bot: 'test_bot' });
+      deliver({ message: { message_id: 3, from: CU, chat: { id: CU.id, type: 'private' }, text: `/start ${joined.code}` } });
+      await hub.inbox.pollOnce(0);
+      expect(hub.store.telegramOwner(CU.id)).toEqual({ id: CU.id, name: 'Cừ', machine: 'cu' });
+      expect(member.store.telegramOwners('cu')).toEqual([{ id: CU.id, name: 'Cừ', machine: 'cu' }]);
+    });
+
+    it("forwards another machine's owner's replies to that machine, which acts on them even if it never heard of that owner", async () => {
+      hub.store.setTelegramOwner({ id: CU.id, name: 'Cừ', machine: 'cu' });
+      deliver(say(CU, { reply_to_message: bridgePost(90) }), say(CU, { text: 'chatting, not a reply' }), say(CU, { chat: { id: -2002, type: 'group' }, reply_to_message: bridgePost(90) }));
+      await hub.inbox.pollOnce(0);
+      await member.inbox.idle();
+      expect(peerCalls).toEqual(['cu.test /telegram/update']);
+      expect(hub.replies).toEqual([]);
+      expect(member.replies).toEqual([{ threadId: THREAD, text: 'Đúng rồi', owner: 'Cừ', seenInChat: true }]);
+      expect(member.store.telegramOwners('cu')).toEqual([{ id: CU.id, name: 'Cừ', machine: 'cu' }]);
+    });
+
+    it('a member learns its owners from the hub when asked, even if the hub could not tell it at the time', async () => {
+      hub.store.setTelegramOwner({ id: CU.id, name: 'Cừ', machine: 'cu' });
+      const res = (await (await member.localApp.request('/local/telegram/owners')).json()) as { owners: unknown[] };
+      expect(res.owners).toEqual([{ id: CU.id, name: 'Cừ', machine: 'cu' }]);
+    });
+
+    it('a link stays valid across a restart of the hub', async () => {
+      tg.respond({ id: 5, username: 'test_bot' });
+      const { code } = (await (await post(hub.localApp, '/local/telegram/claim', {})).json()) as { code: string };
+      const restarted = createTelegramInbox({
+        store: hub.store,
+        selfName: 'anh',
+        settings: () => hub.settings,
+        actions: { ownerReply: async () => ({ id: 'x', thread_id: THREAD, to: 'cu', status: 'sent' }), answerOwnerQuestion: async () => 'answered' },
+        authenticate: () => undefined,
+        fetchImpl,
+        log: () => {},
+      });
+      deliver({ message: { message_id: 4, from: { id: 45, first_name: 'Lan' }, chat: { id: 45, type: 'private' }, text: `/start ${code}` } });
+      await restarted.pollOnce(0);
+      expect(hub.store.telegramOwner(45)?.machine).toBe('anh');
+    });
+
+    it('tells the owner when their machine cannot be reached', async () => {
+      hub.store.setTelegramOwner({ id: 9, name: 'Zed', machine: 'zed' });
+      deliver(say({ id: 9, is_bot: false, first_name: 'Zed' }, { reply_to_message: bridgePost(90) }));
+      await hub.inbox.pollOnce(0);
+      expect(String(calls('sendMessage').at(-1)?.text)).toMatch(/zed/);
+    });
+
+    it('only the hub may push updates or owners to a member, and only a connected machine may join', async () => {
+      const update = { update_id: 1, message: say(CU, { reply_to_message: bridgePost(90) }).message };
+      expect((await post(member.peerApp, '/telegram/update', { update })).status).toBe(401);
+      member.store.upsertPeer({ name: 'zed', url: 'http://zed.test', token: 'tok-cu-zed', folders: [], remoteFolders: [] });
+      expect((await post(member.peerApp, '/telegram/update', { update }, 'tok-cu-zed')).status).toBe(403);
+      expect((await post(member.peerApp, '/telegram/owners', { owners: [{ id: 1, name: 'evil' }] }, 'tok-cu-zed')).status).toBe(403);
+      expect(member.store.telegramOwners()).toEqual([]);
+      expect((await post(hub.peerApp, '/telegram/join', {})).status).toBe(401);
+      expect((await post(member.peerApp, '/telegram/join', {}, 'tok-cu-zed')).status).toBe(404);
+      expect(member.replies).toEqual([]);
+    });
   });
 
-  it("never mistakes a shared-chat message for a private held answer that happens to have the same id", async () => {
-    store.insertDraft({ id: 'd1', thread_id: THREAD, peer: 'cu', question: 'ok?', text: 'x' });
-    store.setDraftPosted('d1', 91);
-    deliver(
-      ownerMessage({ reply_to_message: { message_id: 91, from: { id: 99, is_bot: false }, chat: { id: CHAT }, text: 'hi' } }),
-      ownerMessage({ reply_to_message: { message_id: 91, from: BOT, chat: { id: CHAT }, text: 'agent-bridge: anh posts here' } }),
-    );
-    await inbox().pollOnce(0);
-    expect(replies).toEqual([]);
-  });
+  describe('polling', () => {
+    it('when first switched on, skips whatever was already waiting — old replies must not act now', async () => {
+      const store = new BridgeStore(join(dir, 'fresh.db'));
+      const inbox = createTelegramInbox({
+        store,
+        selfName: 'anh',
+        settings: () => ({ botToken: TOKEN, chatId: CHAT }),
+        actions: { ownerReply: async () => ({ id: 'x', thread_id: THREAD, to: 'cu', status: 'sent' }), answerOwnerQuestion: async () => 'answered' },
+        authenticate: () => undefined,
+        fetchImpl,
+        log: () => {},
+      });
+      tg.respond([{ update_id: 70 }]);
+      deliver();
+      await inbox.pollOnce(0);
+      store.close();
+      expect(calls('getUpdates').slice(0, 2)).toMatchObject([
+        { offset: -1, timeout: 0 },
+        { offset: 71, timeout: 0, allowed_updates: ['message'] },
+      ]);
+    });
 
-  it('ignores other people, other chats, non-replies, replies to people, unknown threads and non-text', async () => {
-    deliver(
-      ownerMessage({ from: { id: 99, is_bot: false, first_name: 'Cừ' }, reply_to_message: bridgePost(90) }),
-      ownerMessage({ chat: { id: -2002 }, reply_to_message: bridgePost(90) }),
-      ownerMessage({}),
-      ownerMessage({ reply_to_message: { ...bridgePost(90), from: { id: 99, is_bot: false } } }),
-      ownerMessage({ reply_to_message: bridgePost(90, 'cu-ffffffff') }),
-      ownerMessage({ text: undefined, photo: [{}], reply_to_message: bridgePost(90) }),
-    );
-    await inbox().pollOnce(0);
-    expect(replies).toEqual([]);
-    expect(calls('setMessageReaction')).toEqual([]);
-  });
+    it('resumes after the last update it took', async () => {
+      deliver(say(ANH, { reply_to_message: bridgePost(90) }));
+      await hub.inbox.pollOnce(0);
+      await hub.inbox.pollOnce(25);
+      expect(calls('getUpdates')[1]).toMatchObject({ offset: updateId + 1, timeout: 25 });
+    });
 
-  it('acts on draft buttons pressed by an owner and tells them what happened', async () => {
-    deliver({ callback_query: { id: 'cb1', from: { id: OWNER.id }, message: { message_id: 91, chat: { id: OWNER.id } }, data: 'd:ab12cd34:send' } });
-    await inbox().pollOnce(0);
-    expect(decisions).toEqual([['ab12cd34', 'send', 'Anh']]);
-    expect(calls('answerCallbackQuery')).toEqual([{ callback_query_id: 'cb1', text: 'Sent' }]);
-    expect(actionsRun).toBe(1);
-
-    outcome = 'already handled';
-    deliver({ callback_query: { id: 'cb2', from: { id: OWNER.id }, message: { message_id: 91, chat: { id: CHAT } }, data: 'd:ab12cd34:drop' } });
-    await inbox().pollOnce(0);
-    expect(calls('answerCallbackQuery')[1]).toEqual({ callback_query_id: 'cb2', text: 'Already handled' });
-  });
-
-  it('says so when the answer could not be sent', async () => {
-    actions.resolveDraft = async () => {
-      throw new Error('not connected to cu any more');
-    };
-    deliver({ callback_query: { id: 'cb1', from: { id: OWNER.id }, message: { message_id: 91, chat: { id: OWNER.id } }, data: 'd:ab12cd34:send' } });
-    await inbox().pollOnce(0);
-    expect(calls('answerCallbackQuery')).toEqual([{ callback_query_id: 'cb1', text: 'Not sent: not connected to cu any more', show_alert: true }]);
-  });
-
-  it('refuses buttons pressed by anyone else', async () => {
-    deliver({ callback_query: { id: 'cb1', from: { id: 99 }, message: { message_id: 91, chat: { id: CHAT } }, data: 'd:ab12cd34:send' } });
-    await inbox().pollOnce(0);
-    expect(decisions).toEqual([]);
-    expect(calls('answerCallbackQuery')).toEqual([{ callback_query_id: 'cb1', text: 'Only Anh can decide this.', show_alert: true }]);
-  });
-
-  it('when first switched on, skips whatever was already waiting — old replies must not act now', async () => {
-    store.close();
-    store = new BridgeStore(join(dir, 'fresh.db'));
-    store.insertMessage({ id: 'q', thread_id: THREAD, from: 'cu', kind: 'ask', text: 'q', sent_at: 'now' }, 'in');
-    tg.respond([{ update_id: 70, ...ownerMessage({ reply_to_message: bridgePost(90) }) }]);
-    deliver(ownerMessage({ reply_to_message: bridgePost(90) }));
-    await inbox().pollOnce(0);
-    const polls = calls('getUpdates');
-    expect(polls[0]).toMatchObject({ offset: -1, timeout: 0 });
-    expect(polls[1]).toMatchObject({ offset: 71, timeout: 0, allowed_updates: ['message', 'callback_query'] });
-    expect(replies).toHaveLength(1);
-  });
-
-  it('resumes after the last update it took, even across restarts', async () => {
-    deliver(ownerMessage({ reply_to_message: bridgePost(90) }));
-    await inbox().pollOnce(0);
-    await inbox().pollOnce(25);
-    const polls = calls('getUpdates');
-    expect(polls[0]).toMatchObject({ offset: 0, timeout: 0, allowed_updates: ['message', 'callback_query'] });
-    expect(polls[1]).toMatchObject({ offset: updateId + 1, timeout: 25 });
-  });
-
-  it('backs off when another program polls the same bot, and on other failures', async () => {
-    tg.fail(409, 'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running');
-    expect(await inbox().pollOnce(0)).toBe(30_000);
-    expect(logs).toEqual(['telegram_poll_conflict']);
-    tg.fail(502, 'Bad Gateway');
-    expect(await inbox().pollOnce(0)).toBe(5_000);
-  });
-
-  it('warns the chat once when another machine keeps reading the same bot', async () => {
-    const ib = inbox();
-    for (let i = 0; i < 5; i++) {
-      tg.fail(409, 'Conflict: terminated by other getUpdates request');
-      await ib.pollOnce(0);
-    }
-    const warnings = calls('sendMessage');
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatchObject({ chat_id: CHAT });
-    expect(String(warnings[0].text)).toMatch(/own bot/);
+    it('backs off on failures, and warns the chat once when another program keeps reading the same bot', async () => {
+      tg.fail(502, 'Bad Gateway');
+      expect(await hub.inbox.pollOnce(0)).toBe(5_000);
+      for (let i = 0; i < 5; i++) {
+        tg.fail(409, 'Conflict: terminated by other getUpdates request');
+        expect(await hub.inbox.pollOnce(0)).toBe(30_000);
+      }
+      const warnings = calls('sendMessage');
+      expect(warnings).toHaveLength(1);
+      expect(String(warnings[0].text)).toMatch(/only one machine/i);
+    });
   });
 });

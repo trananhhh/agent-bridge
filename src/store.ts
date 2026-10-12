@@ -50,21 +50,34 @@ export interface LoggedMessage extends PeerMessage {
  */
 export type MessageVia = 'owner' | 'owner-in-chat';
 
-export type DraftStatus = 'pending' | 'sent' | 'dropped' | 'replaced' | 'superseded';
+/** A Telegram user who speaks for an agent-bridge machine in the shared chat. */
+export interface TelegramOwner {
+  id: number;
+  name: string;
+  machine: string;
+}
 
-/** An answer held back for the owner to send, drop or replace. */
+/** pending → answering (the owner answered; the session is writing the reply) → answered; or superseded by a newer question. */
+export type DraftStatus = 'pending' | 'answering' | 'answered' | 'superseded';
+
+/** A question the answering agent put to the owner before answering a peer; its answer so far is held back. */
 export interface Draft {
   id: string;
   thread_id: string;
   peer: string;
-  /** What the agent asks the owner; absent when held because the owner had already answered. */
   question?: string;
+  /** What the agent had written so far (never sent as is). */
   text: string;
+  /** The session that asked: the owner's answer continues it. */
+  session_id?: string;
+  cwd?: string;
   status: DraftStatus;
   resolved_by?: string;
-  /** Telegram message carrying the buttons, once posted. */
+  /** The owner's answer, when given in Telegram. */
+  answer?: string;
+  /** The Telegram notification, once posted. */
   posted_message_id?: number;
-  /** Status last shown on that post. */
+  /** Status last shown on that notification. */
   shown_status?: DraftStatus;
   created_at: number;
 }
@@ -151,6 +164,11 @@ export class BridgeStore {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS drafts_thread ON drafts (thread_id, status);
+      CREATE TABLE IF NOT EXISTS telegram_owners (
+        tg_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        machine TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -163,6 +181,14 @@ export class BridgeStore {
     const columns = (this.db.prepare('PRAGMA table_info(messages)').all() as Row[]).map((c) => c.name);
     if (!columns.includes('mirror')) this.db.exec('ALTER TABLE messages ADD COLUMN mirror TEXT');
     if (!columns.includes('via')) this.db.exec('ALTER TABLE messages ADD COLUMN via TEXT');
+    const draftColumns = (this.db.prepare('PRAGMA table_info(drafts)').all() as Row[]).map((c) => c.name);
+    if (!draftColumns.includes('session_id')) {
+      // 0.7.0 drafts were answers posted privately with buttons; they mean nothing to this version and their post ids belong to another chat.
+      this.db.exec("UPDATE drafts SET status = 'superseded', shown_status = 'superseded', posted_message_id = -1");
+    }
+    for (const column of ['session_id', 'cwd', 'answer']) {
+      if (!draftColumns.includes(column)) this.db.exec(`ALTER TABLE drafts ADD COLUMN ${column} TEXT`);
+    }
   }
 
   insertMessage(m: PeerMessage, direction: 'in' | 'out', via?: MessageVia): boolean {
@@ -180,10 +206,10 @@ export class BridgeStore {
     return row ? toLogged(row) : undefined;
   }
 
-  insertDraft(d: Pick<Draft, 'id' | 'thread_id' | 'peer' | 'question' | 'text'>): void {
+  insertDraft(d: Pick<Draft, 'id' | 'thread_id' | 'peer' | 'question' | 'text' | 'session_id' | 'cwd'>): void {
     this.db
-      .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)`)
-      .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, Date.now());
+      .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, session_id, cwd, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+      .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, d.session_id ?? null, d.cwd ?? null, Date.now());
   }
 
   getDraft(id: string): Draft | undefined {
@@ -203,9 +229,13 @@ export class BridgeStore {
     return row ? toDraft(row) : undefined;
   }
 
-  /** Moves a pending draft to `status`. False when it was no longer pending, so two clicks never send twice. */
-  resolveDraft(id: string, status: Exclude<DraftStatus, 'pending'>, by: string): boolean {
-    return Number(this.db.prepare("UPDATE drafts SET status = ?, resolved_by = ? WHERE id = ? AND status = 'pending'").run(status, by, id).changes) > 0;
+  /** Moves a pending draft to `status`. False when it was no longer pending, so one answer is never acted on twice. */
+  resolveDraft(id: string, status: Exclude<DraftStatus, 'pending'>, by: string, answer?: string): boolean {
+    return (
+      Number(
+        this.db.prepare("UPDATE drafts SET status = ?, resolved_by = ?, answer = ? WHERE id = ? AND status = 'pending'").run(status, by, answer ?? null, id).changes,
+      ) > 0
+    );
   }
 
   /** Settles every pending draft on a thread; returns their ids. */
@@ -217,8 +247,18 @@ export class BridgeStore {
     return ids;
   }
 
+  /** The session finished replying to the owner's answer. */
+  finishDraft(id: string): void {
+    this.db.prepare("UPDATE drafts SET status = 'answered' WHERE id = ? AND status = 'answering'").run(id);
+  }
+
+  /** Owner answers whose reply was still being written when the daemon stopped. */
+  draftsAnswering(): Draft[] {
+    return (this.db.prepare("SELECT * FROM drafts WHERE status = 'answering' ORDER BY created_at, rowid").all() as Row[]).map(toDraft);
+  }
+
   reopenDraft(id: string): void {
-    this.db.prepare("UPDATE drafts SET status = 'pending', resolved_by = NULL WHERE id = ?").run(id);
+    this.db.prepare("UPDATE drafts SET status = 'pending', resolved_by = NULL, answer = NULL WHERE id = ?").run(id);
   }
 
   threadDrafts(threadId: string): Draft[] {
@@ -451,6 +491,32 @@ export class BridgeStore {
       .run(status, remoteFolders ? JSON.stringify(remoteFolders) : null, id);
   }
 
+  setTelegramOwner(o: TelegramOwner): void {
+    this.db
+      .prepare('INSERT INTO telegram_owners (tg_id, name, machine) VALUES (?, ?, ?) ON CONFLICT (tg_id) DO UPDATE SET name = excluded.name, machine = excluded.machine')
+      .run(o.id, o.name, o.machine);
+  }
+
+  telegramOwner(id: number): TelegramOwner | undefined {
+    const row = this.db.prepare('SELECT * FROM telegram_owners WHERE tg_id = ?').get(id) as Row | undefined;
+    return row ? toOwner(row) : undefined;
+  }
+
+  telegramOwners(machine?: string): TelegramOwner[] {
+    const rows = (
+      machine
+        ? this.db.prepare('SELECT * FROM telegram_owners WHERE machine = ? ORDER BY tg_id').all(machine)
+        : this.db.prepare('SELECT * FROM telegram_owners ORDER BY tg_id').all()
+    ) as Row[];
+    return rows.map(toOwner);
+  }
+
+  /** A machine's owners as its hub last reported them. */
+  replaceTelegramOwners(machine: string, owners: { id: number; name: string }[]): void {
+    this.db.prepare('DELETE FROM telegram_owners WHERE machine = ?').run(machine);
+    for (const o of owners) this.setTelegramOwner({ ...o, machine });
+  }
+
   getKv(key: string): string | undefined {
     const row = this.db.prepare('SELECT value FROM kv WHERE key = ?').get(key) as Row | undefined;
     return row ? String(row.value) : undefined;
@@ -496,6 +562,10 @@ function toLogged(r: Row): LoggedMessage {
   return m;
 }
 
+function toOwner(r: Row): TelegramOwner {
+  return { id: Number(r.tg_id), name: String(r.name), machine: String(r.machine) };
+}
+
 function toDraft(r: Row): Draft {
   const d: Draft = {
     id: String(r.id),
@@ -507,6 +577,9 @@ function toDraft(r: Row): Draft {
   };
   if (r.question !== null) d.question = String(r.question);
   if (r.resolved_by !== null) d.resolved_by = String(r.resolved_by);
+  if (r.session_id) d.session_id = String(r.session_id);
+  if (r.cwd) d.cwd = String(r.cwd);
+  if (r.answer !== null && r.answer !== undefined) d.answer = String(r.answer);
   if (r.posted_message_id !== null) d.posted_message_id = Number(r.posted_message_id);
   if (r.shown_status !== null) d.shown_status = r.shown_status as DraftStatus;
   return d;

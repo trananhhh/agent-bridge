@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BridgeStore } from './store.ts';
-import { channelsFromUpdates, createTelegramMirror, findStart, nextOffset } from './telegram.ts';
+import { channelsFromUpdates, createTelegramMirror, nextOffset } from './telegram.ts';
 import type { PeerMessage } from './protocol.ts';
 import { fakeTelegram } from './test-support/fake-telegram.ts';
 
@@ -27,8 +27,7 @@ describe('telegram mirror', () => {
       store,
       selfName: 'anh',
       target: { botToken: '123:secret', chatId: -1001 },
-      owners: 'Anh',
-      reviewChat: 42,
+      owners: () => 'Anh',
       fetchImpl: tg.fetchImpl,
       log: (event) => logs.push(event),
       now: () => clock,
@@ -102,51 +101,42 @@ describe('telegram mirror', () => {
     expect(posts()).toEqual(['<b>👤 anh → cu</b>  <code>cu-35c42200</code>\n\napproved in private']);
   });
 
-  it('sends a held answer privately to the owner, with Send / Don\'t send buttons; the shared chat only learns that one is waiting', async () => {
+  it("posts the agent's question to its owner in the chat, says how to answer, and marks it once answered", async () => {
     const m = mirror();
-    store.insertDraft({ id: 'ab12cd34', thread_id: THREAD, peer: 'cu', question: 'Chốt 2.400.388 chưa?', text: 'Số chốt: **2.400.388**' });
+    store.insertDraft({ id: 'ab12cd34', thread_id: THREAD, peer: 'cu', question: 'Chốt **2.400.388** chưa?', text: 'x', session_id: 'sess-1', cwd: '/w/tap' });
     await m.tick();
-    const [draft, notice] = tg.sent.map((x) => x.body);
-    expect(notice).toMatchObject({ chat_id: -1001, text: '🙋 <b>anh → cu</b>: an answer is waiting for Anh to check  <code>cu-35c42200</code>' });
-    expect(JSON.stringify(notice)).not.toContain('2.400.388');
-    expect(draft).toMatchObject({
-      chat_id: 42,
-      text: '<b>🙋 For Anh to check</b> · anh → cu  <code>cu-35c42200</code>\n<i>Chốt 2.400.388 chưa?</i>\n\nSố chốt: <b>2.400.388</b>\n\n<i>Reply to this message to answer in your own words.</i>',
-      reply_markup: { inline_keyboard: [[{ text: '✅ Send', callback_data: 'd:ab12cd34:send' }, { text: "🚫 Don't send", callback_data: 'd:ab12cd34:drop' }]] },
-    });
+    const question =
+      '🙋 <b>anh asks Anh</b>  <code>cu-35c42200</code>\nBefore answering cu:\nChốt <b>2.400.388</b> chưa?\n\n' +
+      '<i>Reply to this message to answer, or continue in Claude:</i> <code>cd "/w/tap" &amp;&amp; claude --resume sess-1</code>';
+    expect(tg.sent).toEqual([{ method: 'sendMessage', body: { chat_id: -1001, text: question, parse_mode: 'HTML', link_preview_options: { is_disabled: true } } }]);
     expect(store.draftByPost(101)?.id).toBe('ab12cd34');
 
     await m.tick();
-    expect(tg.sent).toHaveLength(2);
-    store.resolveDraft('ab12cd34', 'sent', 'Anh');
+    expect(tg.sent).toHaveLength(1);
+    store.resolveDraft('ab12cd34', 'answering', 'Anh', 'yes');
+    await m.tick();
+    expect(tg.sent[1].body.text).toBe(`${question}\n\n⏳ Anh answered — the reply is being written`);
+    store.finishDraft('ab12cd34');
     await m.tick();
     expect(tg.sent[2]).toEqual({
-      method: 'editMessageReplyMarkup',
-      body: { chat_id: 42, message_id: 101, reply_markup: { inline_keyboard: [[{ text: '✅ Sent by Anh', callback_data: 'noop' }]] } },
+      method: 'editMessageText',
+      body: { chat_id: -1001, message_id: 101, text: `${question}\n\n✅ Answered by Anh`, parse_mode: 'HTML', link_preview_options: { is_disabled: true } },
     });
     await m.tick();
     expect(tg.sent).toHaveLength(3);
   });
 
-  it('offers only to drop a held answer that has no draft, and says when the owner had answered first', async () => {
+  it('never posts a question replaced before it went out, and marks one replaced afterwards', async () => {
     const m = mirror();
-    store.insertDraft({ id: 'aa', thread_id: THREAD, peer: 'cu', question: 'Chỉ anh biết: thoả thuận 150tr?', text: '' });
-    store.insertDraft({ id: 'bb', thread_id: THREAD, peer: 'cu', text: 'late answer' });
+    store.insertDraft({ id: 'aa', thread_id: THREAD, peer: 'cu', question: 'first?', text: '' });
+    store.resolveDraft('aa', 'superseded', 'agent');
+    store.insertDraft({ id: 'bb', thread_id: THREAD, peer: 'cu', question: 'second?', text: '' });
     await m.tick();
-    const privately = tg.sent.filter((x) => x.body.chat_id === 42).map((x) => x.body);
-    expect(privately[0].reply_markup).toEqual({ inline_keyboard: [[{ text: "🚫 Don't send", callback_data: 'd:aa:drop' }]] });
-    expect(privately[1].text).toContain('<i>You answered first; the agent had also written this.</i>');
-  });
-
-  it('still offers the buttons when Telegram refuses to show a held answer', async () => {
-    const m = mirror();
-    store.insertDraft({ id: 'cc', thread_id: THREAD, peer: 'cu', question: 'q', text: 'x' });
-    tg.fail(400, 'Bad Request: message is too long');
+    expect(tg.sent.map((x) => String(x.body.text))).toEqual([expect.stringContaining('second?')]);
+    expect(tg.sent[0].body.text).toContain('<i>Reply to this message to answer.</i>');
+    store.resolveDraft('bb', 'superseded', 'agent');
     await m.tick();
-    const last = tg.sent.filter((x) => x.body.chat_id === 42).at(-1)!.body;
-    expect(last).toMatchObject({ chat_id: 42, reply_markup: { inline_keyboard: [[{ text: '✅ Send', callback_data: 'd:cc:send' }, { text: "🚫 Don't send", callback_data: 'd:cc:drop' }]] } });
-    expect(last.text).toContain('agent-bridge log cu-35c42200');
-    expect(store.draftByPost(101)?.id).toBe('cc');
+    expect(String(tg.sent[1].body.text)).toMatch(/↪️ Replaced by a newer question$/);
   });
 
   it('keeps its place on a transient failure and resumes from the same message', async () => {
@@ -219,20 +209,6 @@ describe('channelsFromUpdates', () => {
         { message: { chat: { id: 5, type: 'private' } } },
       ]),
     ).toEqual([{ id: -1001, title: 'Bridge log', type: 'channel' }]);
-  });
-});
-
-describe('findStart', () => {
-  it('finds who opened the setup link in a private chat with the bot — only with the exact code', () => {
-    const dm = (id: number) => ({ id, type: 'private' });
-    const updates = [
-      { message: { chat: dm(41), from: { id: 41, first_name: 'Cừ' }, text: '/start' } },
-      { message: { chat: dm(43), from: { id: 43, first_name: 'Lan' }, text: '/start wrongcode' } },
-      { message: { chat: { id: -4001, type: 'group' }, from: { id: 44, first_name: 'X' }, text: '/start a1b2c3d4' } },
-      { message: { chat: dm(42), from: { id: 42, first_name: 'Trần', last_name: 'Anh' }, text: '/start a1b2c3d4' } },
-    ];
-    expect(findStart(updates, 'a1b2c3d4')).toEqual({ id: 42, name: 'Trần Anh' });
-    expect(findStart(updates.slice(0, 3), 'a1b2c3d4')).toBeUndefined();
   });
 });
 

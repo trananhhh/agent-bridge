@@ -317,7 +317,7 @@ describe('agent-bridge daemon', () => {
   describe('owner review', () => {
     let o: Side;
     beforeEach(() => {
-      o = addSide('owner', [{ name: 'anh' }], { ownerReview: { owners: 'Cừ' } });
+      o = addSide('owner', [{ name: 'anh' }], { ownerReview: { owners: () => 'Cừ' } });
       a.store.upsertPeer({ name: 'owner', url: 'http://owner.test', token: pairToken('anh', 'owner'), folders: ['/w/shared'], remoteFolders: [] });
     });
     const ask = async (text = 'final number?') => {
@@ -327,39 +327,98 @@ describe('agent-bridge daemon', () => {
       return { got, thread: sent.thread_id };
     };
 
-    it('lets the agent hand a question to the owner: nothing reaches the peer until the owner sends the draft', async () => {
+    it('lets the agent ask the owner first: nothing reaches the peer, and the question remembers the session to continue', async () => {
       o.answerText = '[[ASK_OWNER]] Chốt 2.400.388 chưa anh?\nSố chốt là **2.400.388**.';
       const { got, thread } = await ask();
       expect(work(o)[0].appendSystemPrompt).toContain('[[ASK_OWNER]]');
       expect(work(o)[0].appendSystemPrompt).toContain('Cừ');
       expect(got).toEqual([]);
-      const draft = o.store.pendingDraft(thread)!;
-      expect(draft).toMatchObject({ question: 'Chốt 2.400.388 chưa anh?', text: 'Số chốt là **2.400.388**.', status: 'pending', peer: 'anh' });
-
-      expect(await o.daemon.resolveDraft(draft.id, 'send', 'Cừ')).toBe('sent');
-      await settle();
-      expect(got).toHaveLength(1);
-      expect(got[0]).toMatchObject({ kind: 'reply', thread_id: thread });
-      expect(got[0].text).toContain('Số chốt là **2.400.388**.');
-      expect(got[0].text).toContain('approved by Cừ');
-      expect(o.store.threadMessages(thread).at(-1)).toMatchObject({ direction: 'out', via: 'owner' });
-      expect(await o.daemon.resolveDraft(draft.id, 'send', 'Cừ')).toBe('already handled');
-      expect(got).toHaveLength(1);
+      expect(o.store.pendingDraft(thread)).toMatchObject({
+        question: 'Chốt 2.400.388 chưa anh?',
+        text: 'Số chốt là **2.400.388**.',
+        status: 'pending',
+        peer: 'anh',
+        session_id: 'owner-new-1',
+        cwd: '/w/shared',
+      });
     });
 
-    it('a newer held answer retires the older one, and an owner reply settles every pending one', async () => {
+    it("feeds the owner's answer back into that session, which then writes the answer the peer gets", async () => {
+      o.answerText = '[[ASK_OWNER]] Chốt 2.400.388 chưa anh?\ndraft';
+      const { got, thread } = await ask();
+      const question = o.store.pendingDraft(thread)!;
+      o.answerText = 'Đã chốt: 2.400.388.';
+      expect(await o.daemon.answerOwnerQuestion(question.id, 'Chốt rồi, gửi đi', 'Cừ')).toBe('answered');
+      await settle();
+      const resumed = work(o).at(-1)!;
+      expect(resumed).toMatchObject({ resumeSessionId: 'owner-new-1', cwd: '/w/shared', readOnlyDirs: ['/w/shared'], model: undefined });
+      expect(resumed.fork).toBeFalsy();
+      expect(resumed.prompt).toContain('Chốt 2.400.388 chưa anh?');
+      expect(resumed.prompt).toContain('Chốt rồi, gửi đi');
+      expect(got.map((m) => [m.kind, m.text])).toEqual([['reply', 'Đã chốt: 2.400.388.']]);
+      expect(o.store.getDraft(question.id)).toMatchObject({ status: 'answered', resolved_by: 'Cừ', answer: 'Chốt rồi, gửi đi' });
+      expect(await o.daemon.answerOwnerQuestion(question.id, 'again', 'Cừ')).toBe('already answered');
+    });
+
+    it("finishes an owner's answer that was still being worked on when the daemon stopped", async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\nx';
+      const { got, thread } = await ask();
+      const question = o.store.pendingDraft(thread)!;
+      o.store.resolveDraft(question.id, 'answering', 'Cừ', 'Chốt');
+      o.answerText = 'Đã chốt.';
+      o.daemon.recover();
+      await settle();
+      expect(got.map((m) => m.text)).toEqual(['Đã chốt.']);
+      expect(work(o).at(-1)?.prompt).toContain('Chốt');
+      expect(o.store.getDraft(question.id)?.status).toBe('answered');
+    });
+
+    it('asks again when the answer still needs the owner', async () => {
+      o.answerText = '[[ASK_OWNER]] first?\nx';
+      const { got, thread } = await ask();
+      const first = o.store.pendingDraft(thread)!;
+      o.answerText = '[[ASK_OWNER]] and the 150tr?\ny';
+      await o.daemon.answerOwnerQuestion(first.id, 'yes', 'Cừ');
+      await settle();
+      expect(got).toEqual([]);
+      expect(o.store.pendingDraft(thread)).toMatchObject({ question: 'and the 150tr?', session_id: 'owner-new-1' });
+    });
+
+    it('a reply sent from the session in Claude settles the question too', async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\nx';
+      const { got, thread } = await ask();
+      const question = o.store.pendingDraft(thread)!;
+      const res = await o.daemon.localApp.request('/local/send', { method: 'POST', body: JSON.stringify({ kind: 'reply', text: 'answered in Claude', thread_id: thread }) });
+      expect(res.status).toBe(200);
+      await settle();
+      expect(got.map((m) => m.text)).toEqual(['answered in Claude']);
+      expect(o.store.getDraft(question.id)).toMatchObject({ status: 'answered', resolved_by: 'Claude' });
+    });
+
+    it('an owner answering in Claude also stops an answer still being written from going out', async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\nx';
+      const { got, thread } = await ask();
+      const question = o.store.pendingDraft(thread)!;
+      let release!: () => void;
+      o.gate = new Promise((r) => (release = r));
+      o.answerText = 'late';
+      await o.daemon.answerOwnerQuestion(question.id, 'yes', 'Cừ');
+      await new Promise((r) => setTimeout(r, 5));
+      await o.daemon.localApp.request('/local/send', { method: 'POST', body: JSON.stringify({ kind: 'reply', text: 'from Claude', thread_id: thread }) });
+      release();
+      await settle();
+      expect(got.map((m) => m.text)).toEqual(['from Claude']);
+    });
+
+    it('a newer question retires the older one on the thread', async () => {
       o.answerText = '[[ASK_OWNER]] first?\ndraft 1';
       const { thread } = await ask();
       const older = o.store.pendingDraft(thread)!;
       o.answerText = '[[ASK_OWNER]] second?\ndraft 2';
       await a.daemon.send({ kind: 'ask', text: 'and this?', threadId: thread, connId: 'a-conn' });
       await settle();
-      const newer = o.store.pendingDraft(thread)!;
-      expect(newer.id).not.toBe(older.id);
+      expect(o.store.pendingDraft(thread)!.id).not.toBe(older.id);
       expect(o.store.getDraft(older.id)?.status).toBe('superseded');
-      await o.daemon.ownerReply({ threadId: thread, text: 'mine', owner: 'Cừ', seenInChat: true });
-      expect(o.store.getDraft(newer.id)?.status).toBe('replaced');
-      expect(o.store.threadMessages(thread).at(-1)?.via).toBe('owner-in-chat');
     });
 
     it('holds the answer wherever the hand-off line appears and however it is formatted', async () => {
@@ -369,53 +428,18 @@ describe('agent-bridge daemon', () => {
       expect(o.store.pendingDraft(thread)).toMatchObject({ question: 'Chốt chưa?', text: 'Đây là trả lời.\nSố chốt 2.400.388' });
     });
 
-    it('a held answer that cannot be sent stays pending', async () => {
+    it("the owner's own words to the peer answer a waiting ask and settle the question; later ones are follow-up asks", async () => {
       o.answerText = '[[ASK_OWNER]] ok?\ndraft';
       const { got, thread } = await ask();
-      const draft = o.store.pendingDraft(thread)!;
-      o.store.removePeer('anh');
-      await expect(o.daemon.resolveDraft(draft.id, 'send', 'Cừ')).rejects.toThrow(/anh/);
-      expect(o.store.getDraft(draft.id)?.status).toBe('pending');
-      await expect(o.daemon.ownerReply({ threadId: thread, text: 'x', owner: 'Cừ' })).rejects.toThrow(/anh/);
-      expect(o.store.getDraft(draft.id)?.status).toBe('pending');
-      expect(got).toEqual([]);
-    });
+      const question = o.store.pendingDraft(thread)!;
 
-    it('tells the session answering a later ask what the owner said and decided on the thread', async () => {
-      o.answerText = '[[ASK_OWNER]] ok?\nSố là 2.400.388';
-      const { thread } = await ask();
-      await o.daemon.resolveDraft(o.store.pendingDraft(thread)!.id, 'drop', 'Cừ');
-      await o.daemon.ownerReply({ threadId: thread, text: 'Số đúng là 2.401.000', owner: 'Cừ' });
+      await o.daemon.ownerReply({ threadId: thread, text: 'Đúng, 2.400.388.', owner: 'Cừ', seenInChat: true });
       await settle();
-      o.answerText = 'ok';
-      await a.daemon.send({ kind: 'ask', text: 'confirm?', threadId: thread, connId: 'a-conn' });
-      await settle();
-      const prompt = work(o).at(-1)!.prompt;
-      expect(prompt).toContain('Số đúng là 2.401.000');
-      expect(prompt).toMatch(/Số là 2\.400\.388[^\n]*not sent/);
-    });
-
-    it("a draft the owner declines is never sent", async () => {
-      o.answerText = '[[ASK_OWNER]] ok?\ndraft';
-      const { got, thread } = await ask();
-      const draft = o.store.pendingDraft(thread)!;
-      expect(await o.daemon.resolveDraft(draft.id, 'drop', 'Cừ')).toBe('dropped');
-      await settle();
-      expect(got).toEqual([]);
-      expect(o.store.getDraft(draft.id)).toMatchObject({ status: 'dropped', resolved_by: 'Cừ' });
-    });
-
-    it("the owner's own words answer a waiting question and replace the draft; later ones are follow-up asks", async () => {
-      o.answerText = '[[ASK_OWNER]] ok?\ndraft';
-      const { got, thread } = await ask();
-      const draft = o.store.pendingDraft(thread)!;
-
-      await o.daemon.ownerReply({ threadId: thread, text: 'Đúng, 2.400.388.', owner: 'Cừ' });
-      await settle();
-      expect(o.store.getDraft(draft.id)?.status).toBe('replaced');
+      expect(o.store.getDraft(question.id)).toMatchObject({ status: 'answered', resolved_by: 'Cừ' });
       expect(got).toHaveLength(1);
       expect(got[0]).toMatchObject({ kind: 'reply', thread_id: thread });
       expect(got[0].text).toMatch(/Cừ[^\n]*person[^]*Đúng, 2\.400\.388\./);
+      expect(o.store.threadMessages(thread).at(-1)?.via).toBe('owner-in-chat');
 
       await o.daemon.ownerReply({ threadId: thread, text: 'Còn khoản 150tr thì sao?', owner: 'Cừ' });
       await settle();
@@ -423,7 +447,7 @@ describe('agent-bridge daemon', () => {
       expect(got[1].text).toContain('Còn khoản 150tr thì sao?');
     });
 
-    it('an answer that finishes after the owner already replied is held for the owner, not sent too', async () => {
+    it('an answer that finishes after the owner already replied is not sent too', async () => {
       o.store.upsertPeer({ name: 'zed', url: 'http://zed.test', token: pairToken('owner', 'zed'), folders: ['/w/shared'], remoteFolders: [] });
       let release!: () => void;
       o.gate = new Promise((r) => (release = r));
@@ -435,8 +459,32 @@ describe('agent-bridge daemon', () => {
       await settle();
       expect(got).toHaveLength(1);
       expect(got[0].text).toContain('tôi trả lời');
-      expect(o.store.pendingDraft(sent.thread_id)).toMatchObject({ text: 'owner#1' });
-      expect(o.store.pendingDraft(sent.thread_id)?.question).toBeUndefined();
+    });
+
+    it('an owner reply that cannot be sent changes nothing', async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\ndraft';
+      const { got, thread } = await ask();
+      const question = o.store.pendingDraft(thread)!;
+      o.store.removePeer('anh');
+      await expect(o.daemon.ownerReply({ threadId: thread, text: 'x', owner: 'Cừ' })).rejects.toThrow(/anh/);
+      await expect(o.daemon.answerOwnerQuestion(question.id, 'x', 'Cừ')).rejects.toThrow(/anh/);
+      expect(o.store.getDraft(question.id)?.status).toBe('pending');
+      expect(got).toEqual([]);
+    });
+
+    it('tells the session answering a later ask what the owner said and answered on the thread', async () => {
+      o.answerText = '[[ASK_OWNER]] Số là 2.400.388?\nx';
+      const { thread } = await ask();
+      o.answerText = 'ok';
+      await o.daemon.answerOwnerQuestion(o.store.pendingDraft(thread)!.id, 'Không, 2.401.000', 'Cừ');
+      await o.daemon.ownerReply({ threadId: thread, text: 'Nhớ trừ phí ship', owner: 'Cừ' });
+      await settle();
+      o.store.upsertThread({ thread_id: thread, session_id: 'other-session' });
+      await a.daemon.send({ kind: 'ask', text: 'confirm?', threadId: thread, connId: 'a-conn' });
+      await settle();
+      const prompt = work(o).at(-1)!.prompt;
+      expect(prompt).toMatch(/Số là 2\.400\.388\?[^\n]*Không, 2\.401\.000/);
+      expect(prompt).toContain('Nhớ trừ phí ship');
     });
 
     it('ignores the hand-off line when nobody reviews this machine', async () => {

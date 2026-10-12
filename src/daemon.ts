@@ -9,7 +9,7 @@ import { expandPath } from './config.ts';
 import { PeerMessageSchema, type MessageKind, type PeerMessage } from './protocol.ts';
 import { buildClassifierPrompt, parseClassifierOutput, resolveTarget, routeInbound, type ClassifierCandidate, type Target } from './router.ts';
 import { isWithin, type SessionCandidate } from './sessions.ts';
-import type { BridgeStore, ConnectRequest, MessageVia, PeerRecord } from './store.ts';
+import type { BridgeStore, ConnectRequest, Draft, MessageVia, PeerRecord } from './store.ts';
 
 /** Peer `folders`: the only directories this peer's questions may be answered from (read-only). First one hosts new sessions. */
 type DaemonPeer = PeerRecord;
@@ -33,8 +33,8 @@ export interface DaemonOptions {
   answerEffort?: Effort;
   /** Telegram chat this machine mirrors its own messages to (tagged on each outgoing message). */
   mirrorChat?: string;
-  /** The owner follows the conversation (in Telegram) and can answer: the agent may hand them questions instead of answering. */
-  ownerReview?: { owners: string };
+  /** Who follows the conversation (in Telegram) and can answer, if anyone: the agent may ask them before answering. Read on every answer. */
+  ownerReview?: { owners: () => string | undefined };
   /** Asks arriving on one thread within this window are answered together. */
   coalesceMs?: number;
   now?: () => number;
@@ -75,13 +75,14 @@ export interface OwnerReplyInput {
   seenInChat?: boolean;
 }
 
-export type DraftOutcome = 'sent' | 'dropped' | 'already handled' | 'nothing to send' | 'not found';
+export type AnswerOutcome = 'answered' | 'already answered' | 'not found';
 
 /** What this machine's owner can do from outside Claude Code (Telegram). */
 export interface OwnerActions {
-  /** The owner's own words on a thread: the answer to a waiting question (settling any held answers), otherwise a follow-up ask. */
+  /** The owner's own words to the peer on a thread: the answer to a waiting ask, otherwise a follow-up ask. */
   ownerReply: (input: OwnerReplyInput) => Promise<SendResult>;
-  resolveDraft: (id: string, action: 'send' | 'drop', owner: string) => Promise<DraftOutcome>;
+  /** The owner answers a question the agent put to them: the asking session continues with it and answers the peer. */
+  answerOwnerQuestion: (id: string, text: string, owner: string) => Promise<AnswerOutcome>;
 }
 
 export interface Daemon extends OwnerActions {
@@ -120,8 +121,9 @@ const ownerReviewPrompt = (owners: string) =>
   `\n\nThe owner of this machine (${owners}) follows this conversation in Telegram and can answer for themselves. ` +
   `Do not commit them to anything they have not clearly agreed to in what you can read (a final amount, a payment, a deal, a deadline, a promise), ` +
   `and do not guess what only they can know. In those cases make the very first line of your reply exactly "${HAND_OFF} " followed by a short question for ${owners} ` +
-  `in the language of the conversation, then write the answer you would send if they agree. They see it with Send / Don't send buttons; ` +
-  'nothing reaches the other side until they decide. Otherwise answer normally.';
+  `in the language of the conversation, then what you have so far. The question is posted in the Telegram group, which the other side can read too. ` +
+  `${owners} is notified, and their answer comes back to you in this session; ` +
+  'nothing reaches the other side until you answer again without that line. Otherwise answer normally.';
 
 const QUESTION_MAX = 1000;
 
@@ -138,14 +140,18 @@ function parseHandOff(text: string): { question: string; draft: string } | undef
 }
 
 const ownerWrote = (owner: string) => `[${owner} (the person, not an agent) wrote this in Telegram]\n\n`;
-const ownerApproved = (owner: string) => `[Checked and approved by ${owner} before sending]\n\n`;
 const OWNER_WROTE = /^\[[^\]\n]* \(the person, not an agent\) wrote this in Telegram\]\n\n/;
-const DRAFT_FATE: Record<string, string> = {
-  sent: 'sent as written',
-  dropped: 'not sent',
-  replaced: 'not sent — they answered in their own words',
-  superseded: 'replaced by a later held answer',
-};
+
+function ownerAnswerPrompt(question: Draft, answer: string, owner: string, lastAsk: PeerMessage | undefined): string {
+  return [
+    `[agent-bridge] ${owner}, the owner of this machine, answered the question you asked them (thread ${question.thread_id}).`,
+    ...(lastAsk ? [`${question.peer}'s agent had asked:`, '---', lastAsk.text, '---'] : []),
+    `Your question to ${owner}: ${question.question ?? '(none)'}`,
+    `Their answer: ${answer}`,
+    '',
+    `Now write your answer to ${question.peer}'s agent; it is sent to them verbatim. If you still need ${owner}, use ${HAND_OFF} again.`,
+  ].join('\n');
+}
 const OWNER_CONTEXT_MAX = 6;
 const clip = (text: string, max: number) => {
   const flat = text.replace(/\s+/g, ' ').trim();
@@ -177,7 +183,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
   const batches = new Map<string, { msgs: PeerMessage[]; ownerSeen: number }>();
   /** Per thread: how many times the owner has replied there, to hold back answers that the owner overtook. */
   const ownerReplies = new Map<string, number>();
-  const review = opts.ownerReview;
+  const reviewers = () => opts.ownerReview?.owners() || undefined;
 
   const track = <T>(p: Promise<T>): Promise<T> => {
     pending.add(p);
@@ -318,37 +324,48 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     return { target: resolveTarget(choice, lives), candidates };
   }
 
-  function holdForOwner(threadId: string, peer: DaemonPeer, question: string | undefined, text: string): void {
+  function askOwner(threadId: string, peer: DaemonPeer, question: string, text: string, sessionId: string | undefined, cwd: string): void {
     store.settlePendingDrafts(threadId, 'superseded', 'agent');
     const id = randomBytes(4).toString('hex');
-    store.insertDraft({ id, thread_id: threadId, peer: peer.name, question, text });
-    log('held_for_owner', { thread: threadId, draft: id, asked: question !== undefined });
+    store.insertDraft({ id, thread_id: threadId, peer: peer.name, question, text, session_id: sessionId, cwd });
+    log('asked_owner', { thread: threadId, question: id, session: sessionId });
   }
 
-  async function runHeadless(
-    batch: PeerMessage[],
-    peer: DaemonPeer,
-    ownerSeen: number,
-    resume?: { sessionId: string; cwd?: string; fork?: boolean },
-  ): Promise<void> {
-    const threadId = batch[0].thread_id;
+  /**
+   * Runs one answering turn and delivers its outcome: the answer to the peer, a question to the owner,
+   * or nothing when the owner already answered the peer meanwhile.
+   */
+  async function runAnswer(task: {
+    threadId: string;
+    peer: DaemonPeer;
+    prompt: string;
+    title: string;
+    resume?: { sessionId: string; cwd?: string; fork?: boolean };
+    /** Owner replies on the thread already counted when this turn was asked for. */
+    ownerSeen: number;
+    onDone?: (sessionId: string | undefined) => void;
+    /** After the outcome was delivered, whatever it was. */
+    onFinish?: () => void;
+  }): Promise<void> {
+    const { threadId, peer, resume } = task;
+    const owners = reviewers();
     const cwd = resume?.cwd && isWithin(resume.cwd, peer.folders) ? resume.cwd : peer.folders[0];
     await serialize(resume?.sessionId ?? threadId, async () => {
       let text: string;
       let sessionId: string | undefined;
       let failed = false;
-      log('headless_start', { thread: threadId, from: peer.name, parts: batch.length, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
+      log('headless_start', { thread: threadId, from: peer.name, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
       const run = (target?: { sessionId: string; fork?: boolean }) =>
         opts.runner({
-          prompt: frameAsk(batch, review ? ownerContext(threadId) : []),
+          prompt: task.prompt,
           cwd,
           resumeSessionId: target?.sessionId,
           fork: target?.fork,
-          name: target && !target.fork ? undefined : sessionTitle(peer.name, batch[0].text),
+          name: target && !target.fork ? undefined : task.title,
           model: opts.answerModel,
           effort: opts.answerEffort,
           readOnlyDirs: peer.folders,
-          appendSystemPrompt: headlessSystemPrompt(peer.name) + (review ? ownerReviewPrompt(review.owners) : ''),
+          appendSystemPrompt: headlessSystemPrompt(peer.name) + (owners ? ownerReviewPrompt(owners) : ''),
           timeoutMs: opts.headlessTimeoutMs,
         });
       try {
@@ -365,30 +382,48 @@ export function createDaemon(opts: DaemonOptions): Daemon {
         text = `[agent-bridge] ${opts.name}'s agent failed to answer: ${(err as Error).message}`;
         log('headless_failed', { thread: threadId, error: (err as Error).message });
       }
-      store.markDelivered(batch.map((m) => m.id));
+      task.onDone?.(sessionId);
       store.upsertThread({ thread_id: threadId, origin: 'remote', peer: peer.name, session_id: sessionId, cwd });
-      if (review) {
-        const overtaken = (ownerReplies.get(threadId) ?? 0) > ownerSeen;
-        if (overtaken) return failed ? log('answer_discarded', { thread: threadId, reason: 'owner replied first' }) : holdForOwner(threadId, peer, undefined, text);
-        const handOff = failed ? undefined : parseHandOff(text);
-        if (handOff) return holdForOwner(threadId, peer, handOff.question, handOff.draft);
+      try {
+        if (owners) {
+          if ((ownerReplies.get(threadId) ?? 0) > task.ownerSeen) return log('answer_discarded', { thread: threadId, reason: 'owner replied first' });
+          const handOff = failed ? undefined : parseHandOff(text);
+          if (handOff) return askOwner(threadId, peer, handOff.question, handOff.draft, sessionId ?? resume?.sessionId, cwd);
+        }
+        await send({ kind: 'reply', text, threadId, sessionId });
+      } finally {
+        task.onFinish?.();
       }
-      await send({ kind: 'reply', text, threadId, sessionId });
     });
   }
 
-  /** What the owner said and decided on this thread in Telegram, which the answering session has not otherwise seen. */
+  function runHeadless(batch: PeerMessage[], peer: DaemonPeer, ownerSeen: number, resume?: { sessionId: string; cwd?: string; fork?: boolean }): Promise<void> {
+    const threadId = batch[0].thread_id;
+    return runAnswer({
+      threadId,
+      peer,
+      prompt: frameAsk(batch, ownerContext(threadId)),
+      title: sessionTitle(peer.name, batch[0].text),
+      resume,
+      ownerSeen,
+      onDone: () => store.markDelivered(batch.map((m) => m.id)),
+    });
+  }
+
+  /** What the owner said and answered on this thread, which a session other than the one that asked has not seen. */
   function ownerContext(threadId: string): string[] {
+    const owners = reviewers();
+    if (!owners) return [];
     const events: { at: number; line: string }[] = [];
     for (const m of store.threadMessages(threadId)) {
-      if (m.via && OWNER_WROTE.test(m.text)) events.push({ at: m.received_at, line: `- they wrote to ${m.kind === 'ask' ? 'ask' : 'answer'}: "${clip(m.text.replace(OWNER_WROTE, ''), 500)}"` });
+      if (m.via && OWNER_WROTE.test(m.text)) events.push({ at: m.received_at, line: `- they wrote to ${m.kind === 'ask' ? 'ask' : 'answer'} ${m.direction === 'out' ? 'the other side' : 'you'}: "${clip(m.text.replace(OWNER_WROTE, ''), 500)}"` });
     }
     for (const d of store.threadDrafts(threadId)) {
-      if (d.status !== 'pending') events.push({ at: d.created_at, line: `- your held answer "${clip(d.text, 160)}" was ${DRAFT_FATE[d.status]}` });
+      if (d.status === 'answered') events.push({ at: d.created_at, line: `- you asked them "${clip(d.question ?? '', 200)}"; they answered ${d.answer ? `"${clip(d.answer, 500)}"` : 'in Claude'}` });
     }
     if (!events.length) return [];
     const lines = events.sort((x, y) => x.at - y.at).slice(-OWNER_CONTEXT_MAX).map((e) => e.line);
-    return [`${review!.owners}, the owner of this machine, acted on this thread in Telegram (oldest first) — take it into account:`, ...lines];
+    return [`${owners}, the owner of this machine, said this on the thread (oldest first) — take it into account:`, ...lines];
   }
 
   /** Asks arriving in a burst on one thread are answered once, together; a thread's answers never run concurrently. */
@@ -443,13 +478,13 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     const to = store.getThread(threadId)?.peer ?? store.threadMessages(threadId).find((m) => m.direction === 'in')?.from;
     const peer = resolvePeer({ kind: 'reply', text: input.text, threadId, to });
     const last = store.lastMessage(threadId);
-    const settled = store.settlePendingDrafts(threadId, 'replaced', input.owner);
-    const answering = settled.length > 0 || (last?.direction === 'in' && last.kind === 'ask');
+    const answering = last?.direction === 'in' && last.kind === 'ask';
+    const settled = store.settlePendingDrafts(threadId, 'answered', input.owner);
     ownerReplies.set(threadId, (ownerReplies.get(threadId) ?? 0) + 1);
-    log('owner_reply', { thread: threadId, kind: answering ? 'reply' : 'ask', replaced: settled });
+    log('owner_reply', { thread: threadId, kind: answering || settled.length ? 'reply' : 'ask', settled });
     try {
       return await send({
-        kind: answering ? 'reply' : 'ask',
+        kind: answering || settled.length ? 'reply' : 'ask',
         text: ownerWrote(input.owner) + input.text,
         threadId,
         to: peer.name,
@@ -461,24 +496,38 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     }
   }
 
-  async function resolveDraft(id: string, action: 'send' | 'drop', owner: string): Promise<DraftOutcome> {
-    const draft = store.getDraft(id);
-    if (!draft) return 'not found';
-    if (action === 'send' && !draft.text) return 'nothing to send';
-    if (action === 'send' && !store.getPeer(draft.peer)) throw new Error(`not connected to ${draft.peer} any more`);
-    if (!store.resolveDraft(id, action === 'send' ? 'sent' : 'dropped', owner)) return 'already handled';
-    log(action === 'send' ? 'draft_sent' : 'draft_dropped', { thread: draft.thread_id, draft: id, by: owner });
-    if (action === 'drop') return 'dropped';
-    try {
-      await send({ kind: 'reply', text: ownerApproved(owner) + draft.text, threadId: draft.thread_id, to: draft.peer, via: 'owner' });
-    } catch (err) {
-      store.reopenDraft(id);
-      throw err;
-    }
-    return 'sent';
+  /** The session that asked the owner continues with their answer, and answers the peer (or asks again). */
+  function continueWithAnswer(question: Draft, peer: DaemonPeer): Promise<void> {
+    const lastAsk = store.threadMessages(question.thread_id).filter((m) => m.direction === 'in' && m.kind === 'ask').at(-1);
+    return runAnswer({
+      threadId: question.thread_id,
+      peer,
+      prompt: ownerAnswerPrompt(question, question.answer ?? '', question.resolved_by ?? 'the owner', lastAsk),
+      title: sessionTitle(peer.name, lastAsk?.text ?? question.question ?? ''),
+      resume: question.session_id ? { sessionId: question.session_id, cwd: question.cwd } : undefined,
+      ownerSeen: ownerReplies.get(question.thread_id) ?? 0,
+      onFinish: () => store.finishDraft(question.id),
+    }).catch((err) => log('owner_answer_failed', { question: question.id, error: (err as Error).message }));
+  }
+
+  async function answerOwnerQuestion(id: string, text: string, owner: string): Promise<AnswerOutcome> {
+    const question = store.getDraft(id);
+    if (!question) return 'not found';
+    const peer = store.getPeer(question.peer);
+    if (!peer) throw new Error(`not connected to ${question.peer} any more`);
+    if (!store.resolveDraft(id, 'answering', owner, text)) return 'already answered';
+    log('owner_answered', { thread: question.thread_id, question: id, by: owner });
+    track(continueWithAnswer(store.getDraft(id)!, peer));
+    return 'answered';
   }
 
   function recover(): void {
+    for (const question of store.draftsAnswering()) {
+      const peer = store.getPeer(question.peer);
+      if (!peer) continue;
+      log('recovered_owner_answer', { question: question.id, thread: question.thread_id });
+      track(continueWithAnswer(question, peer));
+    }
     for (const msg of store.unansweredAsks(now() - RECOVER_WINDOW_MS)) {
       const peer = store.getPeer(msg.from);
       if (!peer) continue;
@@ -736,7 +785,15 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     const d = parsed.data;
     if (d.kind === 'reply' && !d.thread_id) return c.json({ error: 'reply needs thread_id' }, 400);
     try {
-      return c.json(await send({ kind: d.kind, text: d.text, to: d.to, threadId: d.thread_id, connId: d.conn_id, sessionId: d.session_id, cwd: d.cwd }));
+      const sent = await send({ kind: d.kind, text: d.text, to: d.to, threadId: d.thread_id, connId: d.conn_id, sessionId: d.session_id, cwd: d.cwd });
+      // An answer from a session on this machine (e.g. the owner continuing it in Claude) settles questions waiting on the owner,
+      // and an answer still being written for them must not go out as well.
+      if (d.kind === 'reply' && d.thread_id) {
+        const waiting = store.threadDrafts(d.thread_id).some((q) => q.status === 'pending' || q.status === 'answering');
+        store.settlePendingDrafts(d.thread_id, 'answered', 'Claude');
+        if (waiting) ownerReplies.set(d.thread_id, (ownerReplies.get(d.thread_id) ?? 0) + 1);
+      }
+      return c.json(sent);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
     }
@@ -755,7 +812,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     registerLive,
     send,
     ownerReply: (input) => track(ownerReply(input)),
-    resolveDraft: (id, action, owner) => track(resolveDraft(id, action, owner)),
+    answerOwnerQuestion: (id, text, owner) => track(answerOwnerQuestion(id, text, owner)),
     recover,
     flushOutbox,
     idle: async () => {
@@ -804,7 +861,7 @@ function checkFolders(input: string[]): string[] | string {
   return out;
 }
 
-function peerForToken(header: string | undefined, peers: DaemonPeer[]): DaemonPeer | undefined {
+export function peerForToken(header: string | undefined, peers: DaemonPeer[]): DaemonPeer | undefined {
   const presented = header?.replace(/^Bearer\s+/i, '') ?? '';
   return peers.find((p) => safeEqual(presented, p.token));
 }

@@ -102,7 +102,7 @@ describe('BridgeStore', () => {
     store.insertDraft({ id: 'd1', thread_id: 't1', peer: 'cu', text: 'a' });
     store.insertDraft({ id: 'd2', thread_id: 't1', peer: 'cu', text: 'b' });
     store.insertDraft({ id: 'd3', thread_id: 't2', peer: 'cu', text: 'c' });
-    expect(store.settlePendingDrafts('t1', 'replaced', 'Anh')).toEqual(['d1', 'd2']);
+    expect(store.settlePendingDrafts('t1', 'answered', 'Anh')).toEqual(['d1', 'd2']);
     expect(store.getDraft('d3')?.status).toBe('pending');
     store.reopenDraft('d2');
     expect(store.getDraft('d2')).toMatchObject({ status: 'pending' });
@@ -117,20 +117,46 @@ describe('BridgeStore', () => {
     expect(store.unansweredAsks(Date.now() + 60_000)).toEqual([]);
   });
 
+  it('retires drafts left by 0.7.0, which were posted privately with buttons', () => {
+    store.close();
+    const old = join(dir, 'v07.db');
+    const raw = new DatabaseSync(old);
+    raw.exec(`CREATE TABLE drafts (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, peer TEXT NOT NULL, question TEXT, text TEXT NOT NULL,
+      status TEXT NOT NULL, resolved_by TEXT, posted_message_id INTEGER, shown_status TEXT, created_at INTEGER NOT NULL)`);
+    raw.exec(`INSERT INTO drafts VALUES ('p', 't', 'cu', 'q', 'x', 'pending', NULL, 77, 'pending', 1), ('s', 't', 'cu', 'q', 'x', 'sent', 'A', 78, 'pending', 2)`);
+    raw.close();
+    store = new BridgeStore(old);
+    expect(store.pendingDraft('t')).toBeUndefined();
+    expect(store.draftByPost(77)).toBeUndefined();
+    expect(store.draftsToRefresh()).toEqual([]);
+    expect(store.unpostedDrafts()).toEqual([]);
+  });
+
+  it('keeps who answers for which machine in Telegram', () => {
+    store.setTelegramOwner({ id: 42, name: 'Anh', machine: 'anh' });
+    store.setTelegramOwner({ id: 7, name: 'Cừ', machine: 'cu' });
+    store.setTelegramOwner({ id: 42, name: 'Trần Anh', machine: 'anh' });
+    expect(store.telegramOwner(42)).toEqual({ id: 42, name: 'Trần Anh', machine: 'anh' });
+    expect(store.telegramOwner(1)).toBeUndefined();
+    expect(store.telegramOwners('cu')).toEqual([{ id: 7, name: 'Cừ', machine: 'cu' }]);
+    store.replaceTelegramOwners('cu', [{ id: 8, name: 'Cừ 2' }]);
+    expect(store.telegramOwners().map((o) => o.id)).toEqual([8, 42]);
+  });
+
   it('holds drafts until the owner decides, once, and tracks what their Telegram post shows', () => {
-    store.insertDraft({ id: 'd1', thread_id: 't1', peer: 'cu', question: 'ok?', text: 'answer' });
-    expect(store.pendingDraft('t1')).toMatchObject({ id: 'd1', status: 'pending', question: 'ok?' });
+    store.insertDraft({ id: 'd1', thread_id: 't1', peer: 'cu', question: 'ok?', text: 'answer', session_id: 's1', cwd: '/w' });
+    expect(store.pendingDraft('t1')).toMatchObject({ id: 'd1', status: 'pending', question: 'ok?', session_id: 's1', cwd: '/w' });
     expect(store.unpostedDrafts().map((d) => d.id)).toEqual(['d1']);
     store.setDraftPosted('d1', 77);
     expect(store.unpostedDrafts()).toEqual([]);
     expect(store.draftByPost(77)?.id).toBe('d1');
     expect(store.draftsToRefresh()).toEqual([]);
 
-    expect(store.resolveDraft('d1', 'sent', 'Anh')).toBe(true);
-    expect(store.resolveDraft('d1', 'dropped', 'Anh')).toBe(false);
+    expect(store.resolveDraft('d1', 'answered', 'Anh', 'yes')).toBe(true);
+    expect(store.resolveDraft('d1', 'superseded', 'agent')).toBe(false);
     expect(store.pendingDraft('t1')).toBeUndefined();
-    expect(store.draftsToRefresh().map((d) => [d.id, d.status, d.resolved_by])).toEqual([['d1', 'sent', 'Anh']]);
-    store.setDraftShown('d1', 'sent');
+    expect(store.draftsToRefresh().map((d) => [d.id, d.status, d.resolved_by, d.answer])).toEqual([['d1', 'answered', 'Anh', 'yes']]);
+    store.setDraftShown('d1', 'answered');
     expect(store.draftsToRefresh()).toEqual([]);
   });
 

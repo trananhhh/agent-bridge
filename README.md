@@ -55,22 +55,32 @@ Every message passes through both daemons, so **each side keeps the whole exchan
 
 Sessions that answer a colleague are named `⇄ <colleague>: <question>`. Sessions started with `claude -p` are left out of the `/resume` picker, so open them by id. In the session that asked, the question and the answer appear as the `ask_peer` and `peer_inbox` tool calls.
 
-### Telegram group: read along, answer, approve
+### Telegram group: read along and answer
 
-Run `agent-bridge telegram` (the first-run wizard offers it too):
+Run `agent-bridge telegram` (the first-run wizard offers it too).
 
-1. **Bot.** Each machine needs **its own** bot: Telegram lets only one program read a bot's messages. The CLI opens @BotFather; send `/newbot` and paste the token.
-2. **Group.** The CLI opens `t.me/<bot>?startgroup&admin=pin_messages`. Pick the group (or create one) and confirm, which adds the bot as an admin. Bot already in the group? Post `@<bot> hi` there, or pass `--chat=<id>`.
-3. **You.** The CLI prints a one-time link, `t.me/<bot>?start=<code>`. Open it and tap Start. That tells the bot **who you are** (only your replies and button presses act for your machine) and opens your private chat with it, where it sends you answers to check. Only someone at the terminal sees the code.
-4. The bot needs to be an **admin** to see replies to the other side's posts. The CLI warns you if it isn't.
+**One bot for everyone.** Telegram lets only one program read a bot's messages, so one machine reads it (the *hub*), and the others join through it:
+
+- **First machine:** `agent-bridge telegram`. Create a bot with @BotFather (`/newbot`), paste the token, and add the bot to your group as an admin: the CLI opens `t.me/<bot>?startgroup&admin=pin_messages`. If the bot is already in the group, post `@<bot> hi` there or pass `--chat=<id>`.
+- **Every other machine connected to it:** `agent-bridge telegram --hub=<first machine>`. The bot and the group come from the hub over agent-bridge, so no token is passed around.
+- **Then each person** opens the one-time link `t.me/<bot>?start=<code>` that their own CLI prints, and taps Start. From then on, the hub knows that this Telegram account answers for that machine. It acts on that person's replies, or forwards them to their machine. Only someone at that terminal sees the code. Replies from anyone else are ignored.
+- The hub can move later (to a server, say): run `agent-bridge telegram` there with the same token, then `--hub=<new hub>` on the others.
 
 What happens in the group:
 
-- **Every message is posted once**, rendered from the agents' Markdown (bold, lists, code, tables as aligned text). Each side posts what it sends. If the sender doesn't post to this group, the receiver does.
-- **Reply to any post to answer in your own words.** If the post is a question to your machine that is still waiting, your text is the answer, and an answer the agent finishes afterwards is held back instead of being sent too. Otherwise your text goes to the other side as a follow-up. The other agent sees it was written by a person, and your message gets a 👍 once it's on its way.
-- **The agent hands you what it shouldn't decide alone.** It holds back an answer that would commit you to something you haven't clearly agreed to (a final amount, a payment, a deal, a deadline), or that only you can know. The held answer goes to **your private chat with the bot**, with **✅ Send** and **🚫 Don't send** buttons; reply to it to send your own answer instead. The group only sees that an answer is waiting for you, because the other side reads the group too. Nothing reaches them until you decide. The next time the agent answers on that thread, it is told what you wrote and decided.
+- **Every message is posted once**, rendered from the agents' Markdown (bold, lists, code, and tables as aligned text or, on a phone, one card per row). Each side posts what it sends. If the sender doesn't post to this group, the receiver does.
+- **Reply to any post to answer in your own words.** If the post is a question to your machine that is still waiting, your text is the answer, and an answer the agent finishes afterwards is not sent. Otherwise it goes to the other side as a follow-up. The other agent sees it was written by a person, and your message gets a 👍 once it's on its way.
+- **When the agent needs you before answering** (a final amount, a payment, a deal, a deadline, or something only you know), it asks instead of answering: **🙋 &lt;machine&gt; asks &lt;you&gt;** with its question. Answer it either way:
+  - **reply to that post:** your answer goes back into the same session, which then writes the answer the other side gets (or asks you again);
+  - **open the session in Claude** with the `cd … && claude --resume …` line shown in the post, and answer there. The session sends its reply with agent-bridge's `reply` tool.
 
-Messages leave your Tailscale network and are stored by Telegram. The mirror keeps its place across restarts and outages. To stop it, run `agent-bridge telegram off`. A channel also works, read-only, for people who should only read.
+  Nothing reaches the other side until then, and the post is marked once answered. The next time the agent answers on that thread, it is told what you said.
+
+Messages leave your Tailscale network and are stored by Telegram. To stop posting, run `agent-bridge telegram off`. A channel also works, read-only.
+
+### Updates
+
+Each daemon checks GitHub every 6 hours. When there is a new release, it installs it and restarts, after any answer it is writing. The group is told when a machine updated, when an update failed, and when a connected machine runs an older version (with the command for machines older than 0.8.0, which cannot update themselves yet). To turn this off, set `"autoUpdate": false` in `~/.agent-bridge/config.json`; you are then only told that a release is out.
 
 ### Which models answer
 
@@ -99,8 +109,8 @@ agent-bridge note <name>     print the Claude Code note again
 agent-bridge folders <name>  change which folders that person can read
 agent-bridge remove <name>   disconnect
 agent-bridge log [thread]    what the agents said to each other (-f: keep watching)
-agent-bridge telegram [off]  post every message to a Telegram group; answer and approve from there
-agent-bridge status          daemon + each connection online/offline
+agent-bridge telegram [off]  post every message to a Telegram group and answer from there (--hub=<machine> to share its bot)
+agent-bridge status          daemon, updates, Telegram, and each connection (online, version)
 agent-bridge uninstall       stop the daemon, remove the MCP server
 ```
 

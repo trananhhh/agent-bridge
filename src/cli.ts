@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -12,7 +11,7 @@ import { findBridges, parseTailscaleStatus, type FoundBridge } from './discovery
 import { IS_WIN, claudeInvocation, copyToClipboard, findClaude, installService, openUrl, serviceInstalled, uninstallService } from './platform.ts';
 import { shortThreadId } from './protocol.ts';
 import { tailscaleStatus, tailscaleWhois } from './tailscale.ts';
-import { TelegramError, canPost, channelsFromUpdates, findStart, nextOffset, telegramCall, type TelegramUpdate } from './telegram.ts';
+import { TelegramError, canPost, channelsFromUpdates, nextOffset, telegramCall, type TelegramUpdate } from './telegram.ts';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
 const LOG_PATH = join(BRIDGE_HOME, 'daemon.log');
@@ -37,7 +36,8 @@ const HELP = `agent-bridge ${VERSION} — let Claude Code agents on different ma
   agent-bridge folders <name>   change which folders that person can read
   agent-bridge remove <name>    disconnect
   agent-bridge log [thread] [-f] what the agents said to each other (-f: keep watching)
-  agent-bridge telegram [off]   post every message to a Telegram group, and answer or approve from there (--token=, --chat=)
+  agent-bridge telegram [off]   post every message to a Telegram group and answer from there (--chat=, --token=;
+                                --hub=<machine> to share the bot another connected machine already reads)
   agent-bridge status           check daemon, Tailscale and each connection
   agent-bridge uninstall        stop the daemon, remove the MCP server (keeps ~/.agent-bridge)
 `;
@@ -407,10 +407,12 @@ async function cmdStatus(): Promise<void> {
   console.log(`agent-bridge ${VERSION} · ${cfg.name} · http://${cfg.listenHost}:${cfg.peerPort}`);
   console.log(`service: ${serviceInstalled() ? `installed (log ${LOG_PATH})` : 'not installed'}`);
   if (cfg.telegram) {
-    const who = cfg.telegram.owners.map((o) => o.name).join(', ');
-    console.log(`telegram: posting to ${cfg.telegram.chatTitle ?? cfg.telegram.chatId} · ${who ? `${who} can answer from there` : 'read-only (run `agent-bridge telegram` to answer from there)'}`);
+    const owners = await api<{ owners: Owner[] }>('/local/telegram/owners').then((r) => r.owners.map((o) => o.name).join(', ')).catch(() => '');
+    const reader = cfg.telegram.hub ? `bot read by ${cfg.telegram.hub}` : 'bot read here';
+    console.log(`telegram: posting to ${cfg.telegram.chatTitle ?? cfg.telegram.chatId} · ${reader} · ${owners ? `${owners} answer${owners.includes(',') ? '' : 's'} from there` : 'nobody answers from there yet (run `agent-bridge telegram`)'}`);
   }
   console.log(`answers:  ${[cfg.routing.answerModel, cfg.routing.answerEffort].filter(Boolean).join(' ')} · routing by ${cfg.routing.classifierModel}`);
+  console.log(`updates:  ${cfg.autoUpdate ? 'installed automatically (checked every 6 hours)' : 'off — "autoUpdate": false in the config'}`);
   let peers: PeerView[] = [];
   try {
     const s = await api<{ live: number; outbox: number }>('/local/status');
@@ -422,8 +424,8 @@ async function cmdStatus(): Promise<void> {
   for (const p of peers) {
     let state = 'offline / unreachable';
     try {
-      const h = (await (await fetch(`${p.url}/health`, { signal: AbortSignal.timeout(4000) })).json()) as { name?: string };
-      state = h.name === p.name ? 'online' : `online but reports itself as "${h.name}"`;
+      const h = (await (await fetch(`${p.url}/health`, { signal: AbortSignal.timeout(4000) })).json()) as { name?: string; version?: string };
+      state = h.name === p.name ? `online · agent-bridge ${h.version ?? '?'}` : `online but reports itself as "${h.name}"`;
     } catch {
       // stays offline
     }
@@ -435,8 +437,8 @@ const BOTFATHER_URL = 'https://t.me/BotFather';
 const addToChannelUrl = (bot: string) => `https://t.me/${bot}?startchannel&admin=post_messages`;
 const addToGroupUrl = (bot: string) => `https://t.me/${bot}?startgroup&admin=pin_messages`;
 const WAIT_ROUNDS = 48;
-/** The owner may need to find their phone. */
-const OWNER_WAIT_ROUNDS = 120;
+/** The one-time link stays valid this long on the machine that reads the bot. */
+const OWNER_WAIT_MS = 15 * 60_000;
 const ONE_BOT_PER_MACHINE = 'Each machine needs its own bot — two machines cannot read the same bot. Create one with @BotFather (/newbot).';
 
 interface TelegramChat {
@@ -467,7 +469,7 @@ async function pollUpdates(token: string, timeout: number, kinds: string[], offs
 type Owner = { id: number; name: string };
 
 /** Finds the chat from what the bot has seen, including before this command ran. */
-async function detectChat(token: string, bot: string): Promise<{ chat?: TelegramChat; offset: number }> {
+async function detectChat(token: string, bot: string): Promise<TelegramChat | undefined> {
   const kinds = ['my_chat_member', 'channel_post', 'message'];
   const seen = await pollUpdates(token, 0, kinds);
   let offset = nextOffset(seen);
@@ -486,28 +488,27 @@ async function detectChat(token: string, bot: string): Promise<{ chat?: Telegram
       chats = channelsFromUpdates(seen);
     }
   }
-  if (chats.length <= 1) return { chat: chats[0], offset };
+  if (chats.length <= 1) return chats[0];
   chats.forEach((c, n) => console.log(`  ${n + 1}. ${c.title}`));
-  return { chat: chats[Number(await ask('Which chat?', '1')) - 1], offset };
+  return chats[Number(await ask('Which chat?', '1')) - 1];
 }
 
 /**
- * Who answers for this machine: whoever opens a one-time link printed here (only someone at this machine sees it).
- * Opening it starts their private chat with the bot, where held answers will be sent.
+ * Prints this machine's one-time link and waits until someone opens it: the machine that reads the bot then
+ * registers them as an owner of this machine. Only someone at this terminal sees the link.
  */
-async function waitForOwner(token: string, bot: string, offset?: number): Promise<Owner | undefined> {
-  if (offset === undefined) offset = nextOffset(await pollUpdates(token, 0, ['message']));
-  const code = randomBytes(4).toString('hex');
+async function registerOwner(bot: string, code: string): Promise<Owner | undefined> {
+  const current = (await api<{ owners: Owner[] }>('/local/telegram/owners')).owners;
+  const before = new Set(current.map((o) => o.id));
+  if (current.length) console.log(`\nAlready answering for this machine: ${current.map((o) => o.name).join(', ')}. Open the link below only to add someone (Ctrl+C otherwise).`);
   const link = `https://t.me/${bot}?start=${code}`;
-  console.log(`\nOpen this link on your phone and tap Start — it tells @${bot} who you are, and opens the private chat`);
-  console.log(`where it sends you the answers it wants you to check:\n  ${link}`);
+  console.log(`\nOpen this link on your phone and tap Start — it tells @${bot} that you answer for this machine:\n  ${link}`);
   openUrl(link);
-  console.log('Waiting up to 10 minutes…');
-  for (let i = 0; i < OWNER_WAIT_ROUNDS; i++) {
-    const updates = await pollUpdates(token, 5, ['message'], offset);
-    offset = nextOffset(updates, offset);
-    const owner = findStart(updates, code);
-    if (owner) return owner;
+  console.log('Waiting up to 15 minutes…');
+  for (const end = Date.now() + OWNER_WAIT_MS; Date.now() < end; ) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const added = (await api<{ owners: Owner[] }>('/local/telegram/owners')).owners.find((o) => !before.has(o.id));
+    if (added) return added;
   }
   return undefined;
 }
@@ -524,7 +525,7 @@ async function cmdTelegram(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
-    options: { token: { type: 'string' }, chat: { type: 'string' } },
+    options: { token: { type: 'string' }, chat: { type: 'string' }, hub: { type: 'string' } },
   });
   const raw = readRawConfig();
   if (positionals[0] === 'off') {
@@ -534,11 +535,25 @@ async function cmdTelegram(argv: string[]): Promise<void> {
     return console.log('✓ Telegram off');
   }
 
+  // A machine that joined another's bot stays a member when this runs again (reading the bot here too would split its updates).
+  if (!values.hub && !values.token && raw.telegram?.hub) values.hub = raw.telegram.hub;
+  // Share the bot a connected machine already reads: it hands over the bot and the chat, and forwards our owners' replies.
+  if (values.hub) {
+    const joined = await api<{ botToken: string; chatId: number; chatTitle?: string; bot: string; code: string }>('/local/telegram/claim', { hub: values.hub });
+    raw.telegram = { botToken: joined.botToken, chatId: joined.chatId, chatTitle: joined.chatTitle, hub: values.hub };
+    writeRawConfig(raw);
+    await restartDaemon(raw);
+    console.log(`✓ posting to "${joined.chatTitle ?? joined.chatId}" with @${joined.bot}, read by ${values.hub}`);
+    const owner = await registerOwner(joined.bot, joined.code);
+    return console.log(owner ? `✓ ${owner.name} answers for this machine from there` : '! Nobody opened the link — run this again for a new one.');
+  }
+
   let token = values.token?.trim() || raw.telegram?.botToken;
   if (!token) {
-    console.log('Every message between the agents is posted to a Telegram group. You can answer any of them from there,');
-    console.log('and approve answers the agent wants you to check. Messages leave your Tailscale network and are stored by Telegram.\n');
-    console.log(`${ONE_BOT_PER_MACHINE}\n  ${BOTFATHER_URL}`);
+    console.log('Every message between the agents is posted to a Telegram group, where you can answer them.');
+    console.log('Messages leave your Tailscale network and are stored by Telegram.');
+    console.log(`Does a connected colleague already have a bot for this? Run: agent-bridge telegram --hub=<their machine>\n`);
+    console.log(`Otherwise create one: @BotFather → /newbot → copy the token.\n  ${BOTFATHER_URL}`);
     openUrl(BOTFATHER_URL);
     token = (await ask('Bot token')).trim();
   }
@@ -547,60 +562,47 @@ async function cmdTelegram(argv: string[]): Promise<void> {
   });
   console.log(`✓ bot @${bot.username}`);
 
-  // This machine's daemon may be reading the same bot; Telegram allows one reader at a time. Put it back however this ends.
-  const pausedDaemon = Boolean(raw.telegram?.owners?.length) && raw.telegram?.botToken === token && serviceInstalled();
-  if (pausedDaemon) {
-    uninstallService(BRIDGE_HOME);
-    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-      process.once(signal, () => {
-        startDaemon(raw.claudeBin ?? 'claude');
-        process.exit(130);
-      });
+  const known = raw.telegram?.botToken === token ? raw.telegram.chatId : undefined;
+  let chat: TelegramChat | undefined;
+  if (values.chat || known !== undefined) chat = await resolveChannel(token, bot.id, values.chat ?? String(known));
+  else {
+    // Finding the chat reads the bot's updates; this machine's daemon may be reading them too. Put it back however this ends.
+    const pausedDaemon = Boolean(raw.telegram && !raw.telegram.hub && raw.telegram.botToken === token) && serviceInstalled();
+    if (pausedDaemon) {
+      uninstallService(BRIDGE_HOME);
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+        process.once(signal, () => {
+          startDaemon(raw.claudeBin ?? 'claude');
+          process.exit(130);
+        });
+      }
+    }
+    try {
+      chat = await detectChat(token, bot.username);
+    } finally {
+      if (pausedDaemon) await restartDaemon(raw);
     }
   }
-  try {
-    let chat: TelegramChat | undefined;
-    let owner: Owner | undefined;
-    let offset: number | undefined;
-    if (values.chat) chat = await resolveChannel(token, bot.id, values.chat);
-    else ({ chat, offset } = await detectChat(token, bot.username));
-    if (!chat) throw new Error(`No group found. Add @${bot.username} to your group as an admin (${addToGroupUrl(bot.username)}), then run this again.`);
+  if (!chat) throw new Error(`No group found. Add @${bot.username} to your group as an admin (${addToGroupUrl(bot.username)}), then run this again.`);
 
-    const isGroup = chat.type !== 'channel';
-    if (isGroup) owner = await waitForOwner(token, bot.username, offset);
-    if (isGroup && owner && !(await confirm(`${owner.name} (Telegram id ${owner.id}) answers for this machine — is that you?`))) owner = undefined;
-    if (isGroup && !owner) console.log('! Nobody answers for this machine — the group stays read-only for it. Run this again to fix that.');
-    if (isGroup && !(await seesWholeGroup(token, bot.id, chat.id))) {
-      console.log(`! @${bot.username} only sees replies to its own posts. Make it an admin of "${chat.title}" so replies to the other side's posts reach it too.`);
-    }
-
-    // Announce only what changed, so running this again does not repeat itself in the chat.
-    const newChat = raw.telegram?.chatId !== chat.id;
-    if (newChat || owner) {
-      const who = owner ? `${owner.name} can reply to any post here to answer; answers the agent wants checked go to ${owner.name} privately.` : '';
-      await telegramCall(token, 'sendMessage', {
-        chat_id: chat.id,
-        text: (newChat ? `agent-bridge: ${raw.name}'s agent posts what it sends and receives here. ${who}` : `agent-bridge: ${who}`).trim(),
-      });
-    }
-    raw.telegram = { botToken: token, chatId: chat.id, chatTitle: chat.title, owners: owner ? [owner] : [] };
-    writeRawConfig(raw);
-    if (owner) {
-      await telegramCall(token, 'sendMessage', {
-        chat_id: owner.id,
-        text: `✓ You answer for ${raw.name}'s agent. When it holds back an answer for you to check, it arrives here with Send / Don't send buttons — or reply to it with your own answer.`,
-      });
-    }
-    console.log(`✓ posting to "${chat.title}"${owner ? ` · ${owner.name} answers from there` : ''}`);
-    console.log(
-      `\nColleagues can join the same group with their own machine (each message still appears once):\n` +
-        `  1. @BotFather → /newbot → copy the token (their own bot: two machines cannot share one)\n` +
-        `  2. add that bot to "${chat.title}" as an admin\n` +
-        `  3. on their machine: agent-bridge telegram --chat=${chat.id}`,
-    );
-  } finally {
-    await restartDaemon(raw);
+  const newChat = raw.telegram?.chatId !== chat.id;
+  raw.telegram = { botToken: token, chatId: chat.id, chatTitle: chat.title };
+  writeRawConfig(raw);
+  await restartDaemon(raw);
+  console.log(`✓ posting to "${chat.title}"; this machine reads @${bot.username}`);
+  if (newChat) await telegramCall(token, 'sendMessage', { chat_id: chat.id, text: `agent-bridge: ${raw.name}'s agent posts what it sends and receives here.` });
+  if (chat.type === 'channel') return console.log('(A channel is read-only: use a group to answer from Telegram.)');
+  if (!(await seesWholeGroup(token, bot.id, chat.id))) {
+    console.log(`! @${bot.username} only sees replies to its own posts. Make it an admin of "${chat.title}" so replies to everyone's posts reach it.`);
   }
+
+  const { code } = await api<{ code: string }>('/local/telegram/claim', {});
+  const owner = await registerOwner(bot.username, code);
+  console.log(owner ? `✓ ${owner.name} answers for this machine from there` : '! Nobody opened the link — run `agent-bridge telegram` again for a new one.');
+  console.log(
+    `\nColleagues connected to this machine can use the same bot and group — this machine reads it for them. On their machine:\n` +
+      `  agent-bridge telegram --hub=${raw.name}`,
+  );
 }
 
 function cmdUninstall(): void {

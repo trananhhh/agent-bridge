@@ -19,6 +19,8 @@ const ConfigSchema = z.object({
   localPort: z.number().int().positive().default(8791),
   claudeBin: z.string().default('claude'),
   headlessTimeoutMs: z.number().int().positive().default(15 * 60_000),
+  /** Installs new agent-bridge releases by itself (checked every few hours) and restarts. */
+  autoUpdate: z.boolean().default(true),
   routing: z
     .object({
       recentHours: z.number().positive().default(48),
@@ -30,14 +32,14 @@ const ConfigSchema = z.object({
       answerEffort: z.enum(EFFORTS).optional(),
     })
     .prefault({}),
-  /** Every exchange is posted to a Telegram chat; its owners can answer, approve and correct from there (set up with `agent-bridge telegram`). */
+  /** Every exchange is posted to a Telegram chat, where each machine's owners can answer (set up with `agent-bridge telegram`). */
   telegram: z
     .object({
       botToken: z.string().min(1),
       chatId: z.union([z.number(), z.string().min(1)]),
       chatTitle: z.string().optional(),
-      /** Telegram users who speak for this machine in that chat. Nobody else's replies or button presses are acted on. */
-      owners: z.array(z.object({ id: z.number().int(), name: z.string().min(1).max(100) })).default([]),
+      /** The connected machine that reads this (shared) bot and forwards what this machine's owners do. Absent: this machine reads it. */
+      hub: z.string().regex(/^[a-z0-9_-]{1,50}$/).optional(),
     })
     .optional(),
 });

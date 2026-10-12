@@ -10,6 +10,7 @@ describe('parseConfig', () => {
       localPort: 8791,
       claudeBin: 'claude',
       headlessTimeoutMs: 900_000,
+      autoUpdate: true,
       routing: { recentHours: 48, recentLimit: 8, activeWindowMin: 10, classifierModel: 'haiku', answerModel: 'opus' },
     });
   });
@@ -20,20 +21,19 @@ describe('parseConfig', () => {
       botToken: '1:x',
       chatId: -1001,
       chatTitle: 'log',
-      owners: [],
     });
     expect(() => parseConfig({ name: 'anh', listenHost: '100.1.2.3', telegram: { chatId: -1001 } })).toThrow();
   });
 
-  it('takes the answering model and effort, and who may answer from Telegram', () => {
+  it('takes the answering model and effort, and the machine that reads a shared bot', () => {
     const cfg = parseConfig({
       name: 'anh',
       listenHost: '100.1.2.3',
       routing: { answerModel: 'sonnet', answerEffort: 'xhigh' },
-      telegram: { botToken: '1:x', chatId: -1001, owners: [{ id: 42, name: 'Anh' }] },
+      telegram: { botToken: '1:x', chatId: -1001, hub: 'mac-16' },
     });
     expect(cfg.routing).toMatchObject({ answerModel: 'sonnet', answerEffort: 'xhigh', classifierModel: 'haiku' });
-    expect(cfg.telegram?.owners).toEqual([{ id: 42, name: 'Anh' }]);
+    expect(cfg.telegram?.hub).toBe('mac-16');
     expect(() => parseConfig({ name: 'anh', listenHost: '100.1.2.3', routing: { answerEffort: 'extreme' } })).toThrow();
   });
 
