@@ -127,8 +127,8 @@ describe('BridgeStore', () => {
     raw.close();
     store = new BridgeStore(old);
     expect(store.pendingDraft('t')).toBeUndefined();
-    expect(store.draftByPost(77)).toBeUndefined();
-    expect(store.draftsToRefresh()).toEqual([]);
+    expect(store.draftByPost(-1001, 77)).toBeUndefined();
+    expect(store.draftPostsToRefresh()).toEqual([]);
     expect(store.unpostedDrafts()).toEqual([]);
   });
 
@@ -143,21 +143,28 @@ describe('BridgeStore', () => {
     expect(store.telegramOwners().map((o) => o.id)).toEqual([8, 42]);
   });
 
-  it('holds drafts until the owner decides, once, and tracks what their Telegram post shows', () => {
-    store.insertDraft({ id: 'd1', thread_id: 't1', peer: 'cu', question: 'ok?', text: 'answer', session_id: 's1', cwd: '/w' });
-    expect(store.pendingDraft('t1')).toMatchObject({ id: 'd1', status: 'pending', question: 'ok?', session_id: 's1', cwd: '/w' });
+  it('holds drafts until the owner decides, once, and tracks what each of their Telegram posts shows', () => {
+    store.insertDraft({ id: 'd1', thread_id: 't1', peer: 'cu', question: 'ok?', text: 'answer', session_id: 's1', cwd: '/w', private: true });
+    expect(store.pendingDraft('t1')).toMatchObject({ id: 'd1', status: 'pending', question: 'ok?', session_id: 's1', cwd: '/w', private: true });
     expect(store.unpostedDrafts().map((d) => d.id)).toEqual(['d1']);
-    store.setDraftPosted('d1', 77);
+    store.addDraftPost('d1', 42, 7, 'full');
+    store.addDraftPost('d1', -1001, 7, 'notice');
+    store.setDraftPosted('d1');
     expect(store.unpostedDrafts()).toEqual([]);
-    expect(store.draftByPost(77)?.id).toBe('d1');
-    expect(store.draftsToRefresh()).toEqual([]);
+    expect(store.draftByPost(42, 7)?.id).toBe('d1');
+    expect(store.draftByPost(-1001, 7)).toBeUndefined();
+    expect(store.draftPostsToRefresh()).toEqual([]);
 
     expect(store.resolveDraft('d1', 'answered', 'Anh', 'yes')).toBe(true);
     expect(store.resolveDraft('d1', 'superseded', 'agent')).toBe(false);
     expect(store.pendingDraft('t1')).toBeUndefined();
-    expect(store.draftsToRefresh().map((d) => [d.id, d.status, d.resolved_by, d.answer])).toEqual([['d1', 'answered', 'Anh', 'yes']]);
-    store.setDraftShown('d1', 'answered');
-    expect(store.draftsToRefresh()).toEqual([]);
+    expect(store.draftPostsToRefresh().map((p) => [p.draft.id, p.draft.status, p.chat_id, p.message_id, p.kind])).toEqual([
+      ['d1', 'answered', '42', 7, 'full'],
+      ['d1', 'answered', '-1001', 7, 'notice'],
+    ]);
+    store.setDraftPostShown(42, 7, 'answered');
+    store.setDraftPostShown(-1001, 7, 'answered');
+    expect(store.draftPostsToRefresh()).toEqual([]);
   });
 
   it('tracks outbox retries per peer', () => {

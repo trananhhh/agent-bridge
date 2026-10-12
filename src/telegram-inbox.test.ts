@@ -26,6 +26,7 @@ interface Machine {
   settings: TelegramSettings | undefined;
   replies: OwnerReplyInput[];
   answers: [string, string, string][];
+  confirms: [string, string][];
   outcome: AnswerOutcome;
   peerApp: Hono;
   localApp: Hono;
@@ -54,7 +55,7 @@ describe('telegram inbox', () => {
     const store = new BridgeStore(join(dir, `${name}.db`));
     store.setKv('telegram_update_offset', '0');
     for (const p of peers) store.upsertPeer({ name: p, url: `http://${p}.test`, token: `tok-${[name, p].sort().join('-')}`, folders: ['/w'], remoteFolders: [] });
-    const m = { name, store, settings, replies: [], answers: [], outcome: 'answered', peerApp: new Hono(), localApp: new Hono() } as unknown as Machine;
+    const m = { name, store, settings, replies: [], answers: [], confirms: [], outcome: 'answered', peerApp: new Hono(), localApp: new Hono() } as unknown as Machine;
     const actions: OwnerActions = {
       ownerReply: async (input) => {
         m.replies.push(input);
@@ -63,6 +64,10 @@ describe('telegram inbox', () => {
       answerOwnerQuestion: async (id, text, owner) => {
         m.answers.push([id, text, owner]);
         return m.outcome;
+      },
+      confirmOwnerDraft: async (id, owner) => {
+        m.confirms.push([id, owner]);
+        return m.outcome === 'answered' ? 'sent' : m.outcome;
       },
     };
     m.inbox = createTelegramInbox({
@@ -116,7 +121,7 @@ describe('telegram inbox', () => {
 
     it("answers the agent's question when the owner replies to its notification", async () => {
       hub.store.insertDraft({ id: 'q1', thread_id: THREAD, peer: 'cu', question: 'ok?', text: 'x', session_id: 's' });
-      hub.store.setDraftPosted('q1', 91);
+      hub.store.addDraftPost('q1', CHAT, 91, 'full');
       deliver(say(ANH, { reply_to_message: { message_id: 91, from: BOT, chat: { id: CHAT }, text: '🙋 anh needs Trần Anh' } }));
       await hub.inbox.pollOnce(0);
       expect(hub.answers).toEqual([['q1', 'Đúng rồi', 'Trần Anh']]);
@@ -127,6 +132,30 @@ describe('telegram inbox', () => {
       deliver(say(ANH, { reply_to_message: { message_id: 91, from: BOT, chat: { id: CHAT }, text: '🙋' } }));
       await hub.inbox.pollOnce(0);
       expect(String(calls('sendMessage').at(-1)?.text)).toMatch(/already answered/);
+    });
+
+    it("answers a private question when the owner replies to it in their private chat with the bot", async () => {
+      hub.store.insertDraft({ id: 'q2', thread_id: THREAD, peer: 'cu', question: 'private?', text: 'x', private: true });
+      hub.store.addDraftPost('q2', ANH.id, 93, 'full');
+      const dm = { id: ANH.id, type: 'private' };
+      deliver(
+        say(ANH, { chat: dm, reply_to_message: { message_id: 93, from: BOT, chat: dm, text: '🙋' } }),
+        say(ANH, { chat: dm, reply_to_message: { message_id: 90, from: BOT, chat: dm, text: '🙋' } }),
+      );
+      await hub.inbox.pollOnce(0);
+      expect(hub.answers).toEqual([['q2', 'Đúng rồi', 'Trần Anh']]);
+    });
+
+    it('sends the draft when its owner taps ✅ Send, and tells anyone else it is not theirs to send', async () => {
+      hub.store.insertDraft({ id: 'ab12cd34', thread_id: THREAD, peer: 'cu', question: 'ok?', text: 'x' });
+      const tap = (from: { id: number }, data = 'c:ab12cd34') => ({ callback_query: { id: `cb${from.id}`, from, message: { message_id: 91, chat: { id: CHAT } }, data } });
+      deliver(tap(ANH), tap({ id: 99 }));
+      await hub.inbox.pollOnce(0);
+      expect(hub.confirms).toEqual([['ab12cd34', 'Trần Anh']]);
+      expect(calls('answerCallbackQuery')).toEqual([
+        { callback_query_id: 'cb42', text: 'Sent' },
+        { callback_query_id: 'cb99', text: 'Only the owner of this answer can send it.', show_alert: true },
+      ]);
     });
 
     it('finds a plain-text post by the thread id in its text', async () => {
@@ -194,6 +223,17 @@ describe('telegram inbox', () => {
       expect(member.store.telegramOwners('cu')).toEqual([{ id: CU.id, name: 'Cừ', machine: 'cu' }]);
     });
 
+    it("forwards another machine's owner tapping ✅ Send to that machine", async () => {
+      hub.store.setTelegramOwner({ id: CU.id, name: 'Cừ', machine: 'cu' });
+      member.store.insertDraft({ id: 'feed0001', thread_id: THREAD, peer: 'anh', question: 'ok?', text: 'x' });
+      deliver({ callback_query: { id: 'cb7', from: CU, message: { message_id: 95, chat: { id: CHAT } }, data: 'c:feed0001' } });
+      await hub.inbox.pollOnce(0);
+      await member.inbox.idle();
+      expect(peerCalls).toEqual(['cu.test /telegram/update']);
+      expect(member.confirms).toEqual([['feed0001', 'Cừ']]);
+      expect(calls('answerCallbackQuery')).toEqual([{ callback_query_id: 'cb7', text: 'Sent' }]);
+    });
+
     it('a member learns its owners from the hub when asked, even if the hub could not tell it at the time', async () => {
       hub.store.setTelegramOwner({ id: CU.id, name: 'Cừ', machine: 'cu' });
       const res = (await (await member.localApp.request('/local/telegram/owners')).json()) as { owners: unknown[] };
@@ -207,7 +247,11 @@ describe('telegram inbox', () => {
         store: hub.store,
         selfName: 'anh',
         settings: () => hub.settings,
-        actions: { ownerReply: async () => ({ id: 'x', thread_id: THREAD, to: 'cu', status: 'sent' }), answerOwnerQuestion: async () => 'answered' },
+        actions: {
+          ownerReply: async () => ({ id: 'x', thread_id: THREAD, to: 'cu', status: 'sent' }),
+          answerOwnerQuestion: async () => 'answered',
+          confirmOwnerDraft: async () => 'sent',
+        },
         authenticate: () => undefined,
         fetchImpl,
         log: () => {},
@@ -244,7 +288,11 @@ describe('telegram inbox', () => {
         store,
         selfName: 'anh',
         settings: () => ({ botToken: TOKEN, chatId: CHAT }),
-        actions: { ownerReply: async () => ({ id: 'x', thread_id: THREAD, to: 'cu', status: 'sent' }), answerOwnerQuestion: async () => 'answered' },
+        actions: {
+          ownerReply: async () => ({ id: 'x', thread_id: THREAD, to: 'cu', status: 'sent' }),
+          answerOwnerQuestion: async () => 'answered',
+          confirmOwnerDraft: async () => 'sent',
+        },
         authenticate: () => undefined,
         fetchImpl,
         log: () => {},
@@ -255,7 +303,7 @@ describe('telegram inbox', () => {
       store.close();
       expect(calls('getUpdates').slice(0, 2)).toMatchObject([
         { offset: -1, timeout: 0 },
-        { offset: 71, timeout: 0, allowed_updates: ['message'] },
+        { offset: 71, timeout: 0, allowed_updates: ['message', 'callback_query'] },
       ]);
     });
 

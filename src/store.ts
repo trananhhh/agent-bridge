@@ -57,8 +57,11 @@ export interface TelegramOwner {
   machine: string;
 }
 
-/** pending → answering (the owner answered; the session is writing the reply) → answered; or superseded by a newer question. */
-export type DraftStatus = 'pending' | 'answering' | 'answered' | 'superseded';
+/**
+ * pending → answering (the owner answered; the session is writing the reply) → answered,
+ * or pending → sent (the owner confirmed the draft as it was), or superseded by a newer question.
+ */
+export type DraftStatus = 'pending' | 'answering' | 'answered' | 'sent' | 'superseded';
 
 /** A question the answering agent put to the owner before answering a peer; its answer so far is held back. */
 export interface Draft {
@@ -71,15 +74,26 @@ export interface Draft {
   /** The session that asked: the owner's answer continues it. */
   session_id?: string;
   cwd?: string;
+  /** Holds something private to the owner: shown to them alone, while the shared chat only learns that an answer is waiting. */
+  private?: boolean;
   status: DraftStatus;
   resolved_by?: string;
   /** The owner's answer, when given in Telegram. */
   answer?: string;
-  /** The Telegram notification, once posted. */
+  /** Set once posted to Telegram (the ids are in draft_posts). */
   posted_message_id?: number;
-  /** Status last shown on that notification. */
-  shown_status?: DraftStatus;
   created_at: number;
+}
+
+/**
+ * One Telegram message about a draft: the draft itself ('full': its last part, with the button and status;
+ * 'part': an earlier part of a long one), or a "waiting for the owner" line ('notice').
+ */
+export interface DraftPost {
+  draft: Draft;
+  chat_id: string;
+  message_id: number;
+  kind: 'full' | 'part' | 'notice';
 }
 
 export interface ThreadSummary {
@@ -164,6 +178,14 @@ export class BridgeStore {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS drafts_thread ON drafts (thread_id, status);
+      CREATE TABLE IF NOT EXISTS draft_posts (
+        chat_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        draft_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        shown_status TEXT NOT NULL,
+        PRIMARY KEY (chat_id, message_id)
+      );
       CREATE TABLE IF NOT EXISTS telegram_owners (
         tg_id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
@@ -189,6 +211,7 @@ export class BridgeStore {
     for (const column of ['session_id', 'cwd', 'answer']) {
       if (!draftColumns.includes(column)) this.db.exec(`ALTER TABLE drafts ADD COLUMN ${column} TEXT`);
     }
+    if (!draftColumns.includes('private')) this.db.exec('ALTER TABLE drafts ADD COLUMN private INTEGER NOT NULL DEFAULT 0');
   }
 
   insertMessage(m: PeerMessage, direction: 'in' | 'out', via?: MessageVia): boolean {
@@ -206,10 +229,10 @@ export class BridgeStore {
     return row ? toLogged(row) : undefined;
   }
 
-  insertDraft(d: Pick<Draft, 'id' | 'thread_id' | 'peer' | 'question' | 'text' | 'session_id' | 'cwd'>): void {
+  insertDraft(d: Pick<Draft, 'id' | 'thread_id' | 'peer' | 'question' | 'text' | 'session_id' | 'cwd' | 'private'>): void {
     this.db
-      .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, session_id, cwd, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
-      .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, d.session_id ?? null, d.cwd ?? null, Date.now());
+      .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, session_id, cwd, private, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+      .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, d.session_id ?? null, d.cwd ?? null, d.private ? 1 : 0, Date.now());
   }
 
   getDraft(id: string): Draft | undefined {
@@ -224,9 +247,35 @@ export class BridgeStore {
     return row ? toDraft(row) : undefined;
   }
 
-  draftByPost(messageId: number): Draft | undefined {
-    const row = this.db.prepare('SELECT * FROM drafts WHERE posted_message_id = ?').get(messageId) as Row | undefined;
+  /** The draft a Telegram message shows in full (message ids are only unique within a chat). */
+  draftByPost(chatId: number | string, messageId: number): Draft | undefined {
+    const row = this.db
+      .prepare("SELECT d.* FROM draft_posts p JOIN drafts d ON d.id = p.draft_id WHERE p.chat_id = ? AND p.message_id = ? AND p.kind != 'notice'")
+      .get(String(chatId), messageId) as Row | undefined;
     return row ? toDraft(row) : undefined;
+  }
+
+  addDraftPost(draftId: string, chatId: number | string, messageId: number, kind: DraftPost['kind']): void {
+    this.db
+      .prepare(
+        "INSERT OR REPLACE INTO draft_posts (chat_id, message_id, draft_id, kind, shown_status) VALUES (?, ?, ?, ?, (SELECT status FROM drafts WHERE id = ?))",
+      )
+      .run(String(chatId), messageId, draftId, kind, draftId);
+  }
+
+  /** Posts whose draft changed status since they were last updated. */
+  draftPostsToRefresh(): DraftPost[] {
+    const rows = this.db
+      .prepare(
+        `SELECT d.*, p.chat_id AS p_chat, p.message_id AS p_message, p.kind AS p_kind FROM draft_posts p JOIN drafts d ON d.id = p.draft_id
+         WHERE d.status != p.shown_status AND p.kind != 'part' ORDER BY d.created_at, p.rowid`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({ draft: toDraft(r), chat_id: String(r.p_chat), message_id: Number(r.p_message), kind: r.p_kind as DraftPost['kind'] }));
+  }
+
+  setDraftPostShown(chatId: number | string, messageId: number, status: DraftStatus): void {
+    this.db.prepare('UPDATE draft_posts SET shown_status = ? WHERE chat_id = ? AND message_id = ?').run(status, String(chatId), messageId);
   }
 
   /** Moves a pending draft to `status`. False when it was no longer pending, so one answer is never acted on twice. */
@@ -277,19 +326,9 @@ export class BridgeStore {
     return (this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NULL ORDER BY created_at, rowid').all() as Row[]).map(toDraft);
   }
 
-  setDraftPosted(id: string, messageId: number): void {
-    this.db.prepare("UPDATE drafts SET posted_message_id = ?, shown_status = 'pending' WHERE id = ?").run(messageId, id);
-  }
-
-  /** Posted drafts whose status changed since their post was last updated. */
-  draftsToRefresh(): Draft[] {
-    return (
-      this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NOT NULL AND status != shown_status ORDER BY created_at, rowid').all() as Row[]
-    ).map(toDraft);
-  }
-
-  setDraftShown(id: string, status: DraftStatus): void {
-    this.db.prepare('UPDATE drafts SET shown_status = ? WHERE id = ?').run(status, id);
+  /** Done with posting this draft (its messages are in draft_posts). */
+  setDraftPosted(id: string): void {
+    this.db.prepare('UPDATE drafts SET posted_message_id = 0 WHERE id = ?').run(id);
   }
 
   markDelivered(ids: string[]): void {
@@ -581,7 +620,7 @@ function toDraft(r: Row): Draft {
   if (r.cwd) d.cwd = String(r.cwd);
   if (r.answer !== null && r.answer !== undefined) d.answer = String(r.answer);
   if (r.posted_message_id !== null) d.posted_message_id = Number(r.posted_message_id);
-  if (r.shown_status !== null) d.shown_status = r.shown_status as DraftStatus;
+  if (r.private) d.private = true;
   return d;
 }
 

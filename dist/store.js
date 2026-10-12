@@ -67,6 +67,14 @@ export class BridgeStore {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS drafts_thread ON drafts (thread_id, status);
+      CREATE TABLE IF NOT EXISTS draft_posts (
+        chat_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        draft_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        shown_status TEXT NOT NULL,
+        PRIMARY KEY (chat_id, message_id)
+      );
       CREATE TABLE IF NOT EXISTS telegram_owners (
         tg_id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
@@ -95,6 +103,8 @@ export class BridgeStore {
             if (!draftColumns.includes(column))
                 this.db.exec(`ALTER TABLE drafts ADD COLUMN ${column} TEXT`);
         }
+        if (!draftColumns.includes('private'))
+            this.db.exec('ALTER TABLE drafts ADD COLUMN private INTEGER NOT NULL DEFAULT 0');
     }
     insertMessage(m, direction, via) {
         const res = this.db
@@ -109,8 +119,8 @@ export class BridgeStore {
     }
     insertDraft(d) {
         this.db
-            .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, session_id, cwd, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
-            .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, d.session_id ?? null, d.cwd ?? null, Date.now());
+            .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, session_id, cwd, private, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+            .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, d.session_id ?? null, d.cwd ?? null, d.private ? 1 : 0, Date.now());
     }
     getDraft(id) {
         const row = this.db.prepare('SELECT * FROM drafts WHERE id = ?').get(id);
@@ -122,9 +132,28 @@ export class BridgeStore {
             .get(threadId);
         return row ? toDraft(row) : undefined;
     }
-    draftByPost(messageId) {
-        const row = this.db.prepare('SELECT * FROM drafts WHERE posted_message_id = ?').get(messageId);
+    /** The draft a Telegram message shows in full (message ids are only unique within a chat). */
+    draftByPost(chatId, messageId) {
+        const row = this.db
+            .prepare("SELECT d.* FROM draft_posts p JOIN drafts d ON d.id = p.draft_id WHERE p.chat_id = ? AND p.message_id = ? AND p.kind != 'notice'")
+            .get(String(chatId), messageId);
         return row ? toDraft(row) : undefined;
+    }
+    addDraftPost(draftId, chatId, messageId, kind) {
+        this.db
+            .prepare("INSERT OR REPLACE INTO draft_posts (chat_id, message_id, draft_id, kind, shown_status) VALUES (?, ?, ?, ?, (SELECT status FROM drafts WHERE id = ?))")
+            .run(String(chatId), messageId, draftId, kind, draftId);
+    }
+    /** Posts whose draft changed status since they were last updated. */
+    draftPostsToRefresh() {
+        const rows = this.db
+            .prepare(`SELECT d.*, p.chat_id AS p_chat, p.message_id AS p_message, p.kind AS p_kind FROM draft_posts p JOIN drafts d ON d.id = p.draft_id
+         WHERE d.status != p.shown_status AND p.kind != 'part' ORDER BY d.created_at, p.rowid`)
+            .all();
+        return rows.map((r) => ({ draft: toDraft(r), chat_id: String(r.p_chat), message_id: Number(r.p_message), kind: r.p_kind }));
+    }
+    setDraftPostShown(chatId, messageId, status) {
+        this.db.prepare('UPDATE draft_posts SET shown_status = ? WHERE chat_id = ? AND message_id = ?').run(status, String(chatId), messageId);
     }
     /** Moves a pending draft to `status`. False when it was no longer pending, so one answer is never acted on twice. */
     resolveDraft(id, status, by, answer) {
@@ -161,15 +190,9 @@ export class BridgeStore {
     unpostedDrafts() {
         return this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NULL ORDER BY created_at, rowid').all().map(toDraft);
     }
-    setDraftPosted(id, messageId) {
-        this.db.prepare("UPDATE drafts SET posted_message_id = ?, shown_status = 'pending' WHERE id = ?").run(messageId, id);
-    }
-    /** Posted drafts whose status changed since their post was last updated. */
-    draftsToRefresh() {
-        return this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NOT NULL AND status != shown_status ORDER BY created_at, rowid').all().map(toDraft);
-    }
-    setDraftShown(id, status) {
-        this.db.prepare('UPDATE drafts SET shown_status = ? WHERE id = ?').run(status, id);
+    /** Done with posting this draft (its messages are in draft_posts). */
+    setDraftPosted(id) {
+        this.db.prepare('UPDATE drafts SET posted_message_id = 0 WHERE id = ?').run(id);
     }
     markDelivered(ids) {
         const stmt = this.db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?');
@@ -419,8 +442,8 @@ function toDraft(r) {
         d.answer = String(r.answer);
     if (r.posted_message_id !== null)
         d.posted_message_id = Number(r.posted_message_id);
-    if (r.shown_status !== null)
-        d.shown_status = r.shown_status;
+    if (r.private)
+        d.private = true;
     return d;
 }
 function toMessage(r) {

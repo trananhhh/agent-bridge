@@ -410,6 +410,34 @@ describe('agent-bridge daemon', () => {
       expect(got.map((m) => m.text)).toEqual(['from Claude']);
     });
 
+    it('keeps a question about something private to the owner marked private', async () => {
+      o.answerText = '[[ASK_OWNER_PRIVATE]] Có nói với Cừ về khoản vay riêng không?\ndraft';
+      const { got, thread } = await ask();
+      expect(got).toEqual([]);
+      expect(o.store.pendingDraft(thread)).toMatchObject({ question: 'Có nói với Cừ về khoản vay riêng không?', private: true });
+      expect(work(o)[0].appendSystemPrompt).toContain('[[ASK_OWNER_PRIVATE]]');
+    });
+
+    it('the owner confirming the draft sends it as written, once', async () => {
+      o.answerText = '[[ASK_OWNER]] Gửi được chưa?\nSố chốt là **2.400.388**.';
+      const { got, thread } = await ask();
+      const draft = o.store.pendingDraft(thread)!;
+      expect(await o.daemon.confirmOwnerDraft(draft.id, 'Cừ')).toBe('sent');
+      await settle();
+      expect(got.map((m) => m.kind)).toEqual(['reply']);
+      expect(got[0].text).toMatch(/Confirmed by Cừ[^]*Số chốt là \*\*2\.400\.388\*\*\./);
+      expect(o.store.getDraft(draft.id)).toMatchObject({ status: 'sent', resolved_by: 'Cừ' });
+      expect(await o.daemon.confirmOwnerDraft(draft.id, 'Cừ')).toBe('already answered');
+      expect(got).toHaveLength(1);
+    });
+
+    it('there is nothing to confirm when the agent only asked', async () => {
+      o.answerText = '[[ASK_OWNER]] Khoản 150tr là gì?';
+      const { thread } = await ask();
+      expect(await o.daemon.confirmOwnerDraft(o.store.pendingDraft(thread)!.id, 'Cừ')).toBe('nothing to send');
+      expect(o.store.pendingDraft(thread)).toBeDefined();
+    });
+
     it('a newer question retires the older one on the thread', async () => {
       o.answerText = '[[ASK_OWNER]] first?\ndraft 1';
       const { thread } = await ask();

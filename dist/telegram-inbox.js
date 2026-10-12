@@ -1,6 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { TelegramError, telegramCall } from "./telegram.js";
+const SEND_BUTTON = /^c:([0-9a-f]{1,32})$/;
+const TAP_RESULT = {
+    sent: 'Sent',
+    'already answered': 'Already answered',
+    'nothing to send': 'Nothing to send — reply to the post instead',
+    'not found': 'This answer no longer exists',
+};
 const OFFSET_KEY = 'telegram_update_offset';
 const CONFLICT_BACKOFF_MS = 30_000;
 const ERROR_BACKOFF_MS = 5_000;
@@ -11,7 +18,7 @@ const CLAIM_TTL_MS = 15 * 60_000;
 /** Thread ids as posted ("<asker>-<first 8 of uuid>"), for posts that fell back to plain text. */
 const SHORT_THREAD = /\b[a-z0-9_-]+-[0-9a-f]{8}\b/g;
 const START = /^\/start\s+(\S+)$/;
-const UpdateSchema = z.object({ update_id: z.number(), message: z.unknown().optional() }).passthrough();
+const UpdateSchema = z.object({ update_id: z.number(), message: z.unknown().optional(), callback_query: z.unknown().optional() }).passthrough();
 const OwnerSchema = z.object({ id: z.number().int(), name: z.string().min(1).max(100) });
 const OwnersSchema = z.object({ owners: z.array(OwnerSchema).max(20) });
 const fullName = (u) => [u.first_name, u.last_name].filter(Boolean).join(' ') || String(u.id);
@@ -76,8 +83,10 @@ export function createTelegramInbox(opts) {
         const { machine, expires } = JSON.parse(raw);
         return machine && (expires ?? 0) >= now() ? machine : undefined;
     }
-    /** A text reply, in the shared chat, to a post by the bot: the only messages anyone acts on. */
-    const isReplyToBridge = (m) => Boolean(m.text && m.reply_to_message?.from?.is_bot && String(m.chat.id) === String(settings().chatId));
+    /** The shared chat, or this owner's private chat with the bot: the only places an owner acts from. */
+    const where = (chat, owner) => String(chat?.id) === String(settings().chatId) ? 'shared' : chat?.id === owner.id ? 'private' : undefined;
+    /** A text reply to a post by the bot, where this owner acts: the only messages anyone acts on. */
+    const actionable = (m, owner) => Boolean(m.text && m.reply_to_message?.from?.is_bot && where(m.chat, owner));
     function threadOf(post) {
         if (!post.text)
             return undefined;
@@ -93,9 +102,12 @@ export function createTelegramInbox(opts) {
     async function act(m, known) {
         const owner = known ? { ...known, machine: selfName } : m.from && !m.from.is_bot ? store.telegramOwner(m.from.id) : undefined;
         const post = m.reply_to_message;
-        if (!owner || owner.machine !== selfName || !isReplyToBridge(m) || !post)
+        if (!owner || owner.machine !== selfName || !post || !actionable(m, owner))
             return;
-        const question = store.draftByPost(post.message_id);
+        const question = store.draftByPost(m.chat.id, post.message_id);
+        // In the private chat, the bot only posts questions; anything else there is not about a thread.
+        if (!question && where(m.chat, owner) === 'private')
+            return;
         try {
             if (question) {
                 const outcome = await actions.answerOwnerQuestion(question.id, m.text, owner.name);
@@ -116,6 +128,28 @@ export function createTelegramInbox(opts) {
         await call('setMessageReaction', { chat_id: m.chat.id, message_id: m.message_id, reaction: [{ type: 'emoji', emoji: '👍' }] }).catch(() => { });
         opts.afterAction?.();
     }
+    /** ✅ Send under a draft, tapped by one of this machine's owners (`known`: as the hub vouches for them). */
+    async function tap(q, known) {
+        const draftId = SEND_BUTTON.exec(q.data ?? '')?.[1];
+        const owner = known ? { ...known, machine: selfName } : store.telegramOwner(q.from.id);
+        if (!draftId)
+            return void (await call('answerCallbackQuery', { callback_query_id: q.id }).catch(() => { }));
+        // The draft must be this machine's: the same bot carries other machines' drafts too.
+        if (!owner || owner.machine !== selfName || !where(q.message?.chat, owner) || !store.getDraft(draftId)) {
+            await call('answerCallbackQuery', { callback_query_id: q.id, text: 'Only the owner of this answer can send it.', show_alert: true }).catch(() => { });
+            return;
+        }
+        let text;
+        try {
+            text = TAP_RESULT[await actions.confirmOwnerDraft(draftId, owner.name)] ?? 'Done';
+        }
+        catch (err) {
+            await call('answerCallbackQuery', { callback_query_id: q.id, text: `Not sent: ${err.message}`, show_alert: true }).catch(() => { });
+            return;
+        }
+        await call('answerCallbackQuery', { callback_query_id: q.id, text }).catch(() => { });
+        opts.afterAction?.();
+    }
     async function register(user, code) {
         const machine = takeClaim(code);
         if (!machine)
@@ -130,26 +164,33 @@ export function createTelegramInbox(opts) {
         await say(user.id, `✓ You answer for ${machine}'s agent in ${chat}: reply to its posts there.`);
     }
     const ownersOf = (machine) => store.telegramOwners(machine).map(({ id, name }) => ({ id, name }));
-    /** Hub: the setup link, this machine's own owners, or another machine's owners (forwarded). */
+    /** Hub: the setup link, this machine's own owners, or another machine's owners (forwarded to their machine). */
     async function route(u) {
+        const q = u.callback_query;
         const m = u.message;
-        if (!m?.from || m.from.is_bot)
+        const from = q?.from ?? m?.from;
+        if (!from || from.is_bot)
             return;
-        if (m.chat.type === 'private') {
-            const code = START.exec(m.text?.trim() ?? '')?.[1];
-            return code ? register(m.from, code) : undefined;
-        }
-        const owner = store.telegramOwner(m.from.id);
-        if (!owner || !isReplyToBridge(m))
+        const code = m?.chat.type === 'private' ? START.exec(m.text?.trim() ?? '')?.[1] : undefined;
+        if (code)
+            return register(from, code);
+        const owner = store.telegramOwner(from.id);
+        if (!owner)
+            return q ? tap(q) : undefined;
+        if (m && !actionable(m, owner))
             return;
         if (owner.machine === selfName)
-            return act(m);
+            return q ? tap(q) : act(m);
         try {
             await toPeer(owner.machine, '/telegram/update', { update: u, owner: { id: owner.id, name: owner.name } });
         }
         catch (err) {
             opts.log('telegram_forward_failed', { machine: owner.machine, error: err.message });
-            await say(m.chat.id, `⚠️ Could not reach ${owner.machine}'s machine, so this was not delivered. Try again when it is online.`, m.message_id);
+            const text = `⚠️ Could not reach ${owner.machine}'s machine, so this was not delivered. Try again when it is online.`;
+            if (q)
+                await call('answerCallbackQuery', { callback_query_id: q.id, text, show_alert: true }).catch(() => { });
+            else
+                await say(m.chat.id, text, m.message_id);
         }
     }
     async function pollOnce(timeoutS = 25) {
@@ -160,7 +201,7 @@ export function createTelegramInbox(opts) {
                 const [latest] = await call('getUpdates', { offset: -1, timeout: 0 });
                 store.setKv(OFFSET_KEY, String(latest ? latest.update_id + 1 : 0));
             }
-            updates = await call('getUpdates', { offset: Number(store.getKv(OFFSET_KEY)), timeout: timeoutS, allowed_updates: ['message'] }, (timeoutS + 15) * 1000);
+            updates = await call('getUpdates', { offset: Number(store.getKv(OFFSET_KEY)), timeout: timeoutS, allowed_updates: ['message', 'callback_query'] }, (timeoutS + 15) * 1000);
             lastError = undefined;
             conflicts = 0;
         }
@@ -224,11 +265,11 @@ export function createTelegramInbox(opts) {
             const parsed = z.object({ update: UpdateSchema, owner: OwnerSchema }).safeParse(await c.req.json().catch(() => null));
             if (!parsed.success)
                 return c.json({ error: 'invalid update' }, 400);
-            const m = parsed.data.update.message;
+            const { message: m, callback_query: q } = parsed.data.update;
             // The hub vouches for who this is; remember it, and answer the hub at once (acting may take a while).
             store.setTelegramOwner({ ...parsed.data.owner, machine: selfName });
-            if (m) {
-                const job = act(m, parsed.data.owner).catch((err) => opts.log('telegram_update_failed', { error: err.message }));
+            if (m || q) {
+                const job = (q ? tap(q, parsed.data.owner) : act(m, parsed.data.owner)).catch((err) => opts.log('telegram_update_failed', { error: err.message }));
                 working.add(job);
                 void job.finally(() => working.delete(job));
             }

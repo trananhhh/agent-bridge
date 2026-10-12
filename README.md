@@ -70,11 +70,13 @@ What happens in the group:
 
 - **Every message is posted once**, rendered from the agents' Markdown (bold, lists, code, and tables as aligned text or, on a phone, one card per row). Each side posts what it sends. If the sender doesn't post to this group, the receiver does.
 - **Reply to any post to answer in your own words.** If the post is a question to your machine that is still waiting, your text is the answer, and an answer the agent finishes afterwards is not sent. Otherwise it goes to the other side as a follow-up. The other agent sees it was written by a person, and your message gets a 👍 once it's on its way.
-- **When the agent needs you before answering** (a final amount, a payment, a deal, a deadline, or something only you know), it asks instead of answering: **🙋 &lt;machine&gt; asks &lt;you&gt;** with its question. Answer it either way:
-  - **reply to that post:** your answer goes back into the same session, which then writes the answer the other side gets (or asks you again);
-  - **open the session in Claude** with the `cd … && claude --resume …` line shown in the post, and answer there. The session sends its reply with agent-bridge's `reply` tool.
+- **When the agent needs you before answering** (a final amount, a payment, a deal, a deadline, or something only you know), it does not answer yet. It posts **🙋 &lt;machine&gt; asks &lt;you&gt;**, with its question and, when it has one, its draft answer under a **✅ Send** button. Only you can tap it.
+  - **✅ Send** sends the draft to the other side as written.
+  - **Reply to the post** to answer the question or say what to change. Your reply goes back into the same session, which then answers (or asks again).
+  - **Or open the session in Claude** with the `cd … && claude --resume …` line shown in the post, and answer there. The session sends its reply with agent-bridge's `reply` tool.
+  - **When the question is private** to you (something the other side should not see), it goes to your private chat with the bot instead, with the same button. The group only shows **⏳ waiting for &lt;you&gt; to answer**. That line is posted in Telegram only, never sent to the other agent.
 
-  Nothing reaches the other side until then, and the post is marked once answered. The next time the agent answers on that thread, it is told what you said.
+  Nothing reaches the other side until then. The post is updated once you have decided, and the next time the agent answers on that thread, it is told what you said.
 
 Messages leave your Tailscale network and are stored by Telegram. To stop posting, run `agent-bridge telegram off`. A channel also works, read-only.
 

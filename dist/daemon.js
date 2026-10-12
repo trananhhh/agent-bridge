@@ -23,26 +23,32 @@ const headlessSystemPrompt = (peer) => `You are answering a message from ${peer}
     'You can only READ the folders shared with this person. You cannot write anything; if the request needs writing, editing or running commands, ' +
     'say exactly what is needed and that the owner of this machine must do it themselves. Your final answer is sent verbatim to the other agent.';
 const HAND_OFF = '[[ASK_OWNER]]';
-const ownerReviewPrompt = (owners) => `\n\nThe owner of this machine (${owners}) follows this conversation in Telegram and can answer for themselves. ` +
+const HAND_OFF_PRIVATE = '[[ASK_OWNER_PRIVATE]]';
+const ownerReviewPrompt = (owners) => `\n\nThe owner of this machine (${owners}) follows this conversation in a Telegram group that the other side reads too, and can answer for themselves. ` +
     `Do not commit them to anything they have not clearly agreed to in what you can read (a final amount, a payment, a deal, a deadline, a promise), ` +
-    `and do not guess what only they can know. In those cases make the very first line of your reply exactly "${HAND_OFF} " followed by a short question for ${owners} ` +
-    `in the language of the conversation, then what you have so far. The question is posted in the Telegram group, which the other side can read too. ` +
-    `${owners} is notified, and their answer comes back to you in this session; ` +
-    'nothing reaches the other side until you answer again without that line. Otherwise answer normally.';
+    `and do not guess what only they can know. In those cases do not answer yet: make the very first line of your reply ` +
+    `"${HAND_OFF} " followed by a short question for ${owners} in the language of the conversation, then the answer you would send (if you have one). ` +
+    `It is posted in the group with a Send button: ${owners} sends it as written, or replies, and their reply comes back to you in this session. ` +
+    `If the question or your answer touches something private or sensitive to ${owners} that the other side should not see, use "${HAND_OFF_PRIVATE} " instead: ` +
+    `it goes to ${owners} alone, and the group only sees that an answer is waiting for them. ` +
+    'Nothing reaches the other side until then. Otherwise answer normally.';
 const QUESTION_MAX = 1000;
-/** Fails closed: the marker anywhere, however formatted, holds the answer. Its line is the question; the rest is the draft. */
+/** Fails closed: either marker anywhere, however formatted, holds the answer. Its line is the question; the rest is the draft. */
 function parseHandOff(text) {
     const lines = text.split('\n');
-    const at = lines.findIndex((l) => l.includes(HAND_OFF));
+    const at = lines.findIndex((l) => l.includes(HAND_OFF) || l.includes(HAND_OFF_PRIVATE));
     if (at === -1)
         return undefined;
-    const question = lines[at].replace(HAND_OFF, '').replace(/[*_`~#>]/g, '').trim() || 'OK to send?';
+    const isPrivate = lines[at].includes(HAND_OFF_PRIVATE);
+    const question = lines[at].replace(isPrivate ? HAND_OFF_PRIVATE : HAND_OFF, '').replace(/[*_`~#>]/g, '').trim() || 'OK to send?';
     return {
         question: question.length > QUESTION_MAX ? `${question.slice(0, QUESTION_MAX - 1)}…` : question,
         draft: [...lines.slice(0, at), ...lines.slice(at + 1)].join('\n').trim(),
+        private: isPrivate,
     };
 }
 const ownerWrote = (owner) => `[${owner} (the person, not an agent) wrote this in Telegram]\n\n`;
+const ownerConfirmed = (owner) => `[Confirmed by ${owner} before sending]\n\n`;
 const OWNER_WROTE = /^\[[^\]\n]* \(the person, not an agent\) wrote this in Telegram\]\n\n/;
 function ownerAnswerPrompt(question, answer, owner, lastAsk) {
     return [
@@ -226,11 +232,11 @@ export function createDaemon(opts) {
         log('classified', { thread: msg.thread_id, from: peer.name, choice });
         return { target: resolveTarget(choice, lives), candidates };
     }
-    function askOwner(threadId, peer, question, text, sessionId, cwd) {
+    function askOwner(threadId, peer, handOff, sessionId, cwd) {
         store.settlePendingDrafts(threadId, 'superseded', 'agent');
         const id = randomBytes(4).toString('hex');
-        store.insertDraft({ id, thread_id: threadId, peer: peer.name, question, text, session_id: sessionId, cwd });
-        log('asked_owner', { thread: threadId, question: id, session: sessionId });
+        store.insertDraft({ id, thread_id: threadId, peer: peer.name, question: handOff.question, text: handOff.draft, session_id: sessionId, cwd, private: handOff.private });
+        log('asked_owner', { thread: threadId, question: id, session: sessionId, private: handOff.private });
     }
     /**
      * Runs one answering turn and delivers its outcome: the answer to the peer, a question to the owner,
@@ -281,7 +287,7 @@ export function createDaemon(opts) {
                         return log('answer_discarded', { thread: threadId, reason: 'owner replied first' });
                     const handOff = failed ? undefined : parseHandOff(text);
                     if (handOff)
-                        return askOwner(threadId, peer, handOff.question, handOff.draft, sessionId ?? resume?.sessionId, cwd);
+                        return askOwner(threadId, peer, handOff, sessionId ?? resume?.sessionId, cwd);
                 }
                 await send({ kind: 'reply', text, threadId, sessionId });
             }
@@ -315,6 +321,8 @@ export function createDaemon(opts) {
         for (const d of store.threadDrafts(threadId)) {
             if (d.status === 'answered')
                 events.push({ at: d.created_at, line: `- you asked them "${clip(d.question ?? '', 200)}"; they answered ${d.answer ? `"${clip(d.answer, 500)}"` : 'in Claude'}` });
+            if (d.status === 'sent')
+                events.push({ at: d.created_at, line: `- they confirmed your answer "${clip(d.text, 200)}" and it was sent as written` });
         }
         if (!events.length)
             return [];
@@ -419,6 +427,29 @@ export function createDaemon(opts) {
         log('owner_answered', { thread: question.thread_id, question: id, by: owner });
         track(continueWithAnswer(store.getDraft(id), peer));
         return 'answered';
+    }
+    async function confirmOwnerDraft(id, owner) {
+        const draft = store.getDraft(id);
+        if (!draft)
+            return 'not found';
+        if (draft.status !== 'pending')
+            return 'already answered';
+        if (!draft.text)
+            return 'nothing to send';
+        if (!store.getPeer(draft.peer))
+            throw new Error(`not connected to ${draft.peer} any more`);
+        if (!store.resolveDraft(id, 'sent', owner))
+            return 'already answered';
+        log('owner_confirmed', { thread: draft.thread_id, draft: id, by: owner });
+        ownerReplies.set(draft.thread_id, (ownerReplies.get(draft.thread_id) ?? 0) + 1);
+        try {
+            await send({ kind: 'reply', text: ownerConfirmed(owner) + draft.text, threadId: draft.thread_id, to: draft.peer, via: 'owner' });
+        }
+        catch (err) {
+            store.reopenDraft(id);
+            throw err;
+        }
+        return 'sent';
     }
     function recover() {
         for (const question of store.draftsAnswering()) {
@@ -730,6 +761,7 @@ export function createDaemon(opts) {
         send,
         ownerReply: (input) => track(ownerReply(input)),
         answerOwnerQuestion: (id, text, owner) => track(answerOwnerQuestion(id, text, owner)),
+        confirmOwnerDraft: (id, owner) => track(confirmOwnerDraft(id, owner)),
         recover,
         flushOutbox,
         idle: async () => {

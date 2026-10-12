@@ -65,7 +65,7 @@ export async function runDaemon(opts = {}) {
         whois: tailscaleWhois,
         notify,
     });
-    const mirror = cfg.telegram ? createTelegramMirror({ store, selfName: cfg.name, target: cfg.telegram, owners: ownerNames, log }) : undefined;
+    const mirror = cfg.telegram ? createTelegramMirror({ store, selfName: cfg.name, target: cfg.telegram, owners: () => store.telegramOwners(cfg.name), log }) : undefined;
     // Mounted even before Telegram is set up here: joining a shared bot happens through these endpoints.
     const inbox = createTelegramInbox({
         store,

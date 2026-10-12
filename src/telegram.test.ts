@@ -27,7 +27,7 @@ describe('telegram mirror', () => {
       store,
       selfName: 'anh',
       target: { botToken: '123:secret', chatId: -1001 },
-      owners: () => 'Anh',
+      owners: () => [{ id: 42, name: 'Anh' }],
       fetchImpl: tg.fetchImpl,
       log: (event) => logs.push(event),
       now: () => clock,
@@ -101,29 +101,74 @@ describe('telegram mirror', () => {
     expect(posts()).toEqual(['<b>👤 anh → cu</b>  <code>cu-35c42200</code>\n\napproved in private']);
   });
 
-  it("posts the agent's question to its owner in the chat, says how to answer, and marks it once answered", async () => {
+  it("posts the agent's draft and question in the chat with a Send button, and marks it once decided", async () => {
     const m = mirror();
-    store.insertDraft({ id: 'ab12cd34', thread_id: THREAD, peer: 'cu', question: 'Chốt **2.400.388** chưa?', text: 'x', session_id: 'sess-1', cwd: '/w/tap' });
+    store.insertDraft({ id: 'ab12cd34', thread_id: THREAD, peer: 'cu', question: 'Gửi số **2.400.388** được chưa?', text: 'Số chốt: **2.400.388**', session_id: 'sess-1', cwd: '/w/tap' });
     await m.tick();
-    const question =
-      '🙋 <b>anh asks Anh</b>  <code>cu-35c42200</code>\nBefore answering cu:\nChốt <b>2.400.388</b> chưa?\n\n' +
-      '<i>Reply to this message to answer, or continue in Claude:</i> <code>cd "/w/tap" &amp;&amp; claude --resume sess-1</code>';
-    expect(tg.sent).toEqual([{ method: 'sendMessage', body: { chat_id: -1001, text: question, parse_mode: 'HTML', link_preview_options: { is_disabled: true } } }]);
-    expect(store.draftByPost(101)?.id).toBe('ab12cd34');
+    const body =
+      '🙋 <b>anh asks Anh</b>  <code>cu-35c42200</code>\nBefore answering cu:\nGửi số <b>2.400.388</b> được chưa?\n\n' +
+      '<b>Draft answer:</b>\nSố chốt: <b>2.400.388</b>\n\n' +
+      '<i>✅ Send sends it as written. Or reply to this message: your reply goes to the agent, which answers again.</i>\n' +
+      '<i>Or continue in Claude:</i> <code>cd "/w/tap" &amp;&amp; claude --resume sess-1</code>';
+    expect(tg.sent).toEqual([
+      {
+        method: 'sendMessage',
+        body: {
+          chat_id: -1001,
+          text: body,
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: { inline_keyboard: [[{ text: '✅ Send', callback_data: 'c:ab12cd34' }]] },
+        },
+      },
+    ]);
+    expect(store.draftByPost(-1001, 101)?.id).toBe('ab12cd34');
 
     await m.tick();
     expect(tg.sent).toHaveLength(1);
-    store.resolveDraft('ab12cd34', 'answering', 'Anh', 'yes');
+    store.resolveDraft('ab12cd34', 'sent', 'Anh');
     await m.tick();
-    expect(tg.sent[1].body.text).toBe(`${question}\n\n⏳ Anh answered — the reply is being written`);
-    store.finishDraft('ab12cd34');
-    await m.tick();
-    expect(tg.sent[2]).toEqual({
+    expect(tg.sent[1]).toEqual({
       method: 'editMessageText',
-      body: { chat_id: -1001, message_id: 101, text: `${question}\n\n✅ Answered by Anh`, parse_mode: 'HTML', link_preview_options: { is_disabled: true } },
+      body: { chat_id: '-1001', message_id: 101, text: `${body}\n\n✅ Sent as written, confirmed by Anh`, parse_mode: 'HTML', link_preview_options: { is_disabled: true } },
     });
     await m.tick();
-    expect(tg.sent).toHaveLength(3);
+    expect(tg.sent).toHaveLength(2);
+  });
+
+  it('a question with no draft has no Send button; its status follows the answer', async () => {
+    const m = mirror();
+    store.insertDraft({ id: 'aa', thread_id: THREAD, peer: 'cu', question: 'Khoản 150tr là gì?', text: '' });
+    await m.tick();
+    expect(tg.sent[0].body.reply_markup).toBeUndefined();
+    expect(tg.sent[0].body.text).toContain('<i>Reply to this message to answer.</i>');
+    store.resolveDraft('aa', 'answering', 'Anh', 'là tiền cọc');
+    await m.tick();
+    expect(String(tg.sent[1].body.text)).toMatch(/⏳ Anh answered — the reply is being written$/);
+    store.finishDraft('aa');
+    await m.tick();
+    expect(String(tg.sent[2].body.text)).toMatch(/✅ Answered by Anh$/);
+  });
+
+  it('sends a private question to the owner alone; the chat only learns an answer is waiting, never what', async () => {
+    const m = mirror();
+    store.insertDraft({ id: 'pp', thread_id: THREAD, peer: 'cu', question: 'Khoản vay riêng 50tr?', text: 'Không có khoản vay.', private: true });
+    await m.tick();
+    const [toOwner, notice] = tg.sent.map((x) => x.body);
+    expect(toOwner).toMatchObject({ chat_id: 42, reply_markup: { inline_keyboard: [[{ text: '✅ Send', callback_data: 'c:pp' }]] } });
+    expect(String(toOwner.text)).toContain('Khoản vay riêng 50tr?');
+    expect(notice).toMatchObject({ chat_id: -1001, text: '⏳ <b>anh → cu</b>: waiting for Anh to answer  <code>cu-35c42200</code>' });
+    expect(JSON.stringify(notice)).not.toMatch(/50tr|vay/);
+    expect(store.draftByPost(42, 101)?.id).toBe('pp');
+    expect(store.draftByPost(-1001, 102)).toBeUndefined();
+
+    store.resolveDraft('pp', 'answering', 'Anh', 'ok');
+    store.finishDraft('pp');
+    await m.tick();
+    expect(tg.sent.slice(2).map((x) => [x.body.chat_id, String(x.body.text).split('\n').at(-1)])).toEqual([
+      ['42', '✅ Answered by Anh'],
+      ['-1001', '✅ Answered by Anh'],
+    ]);
   });
 
   it('never posts a question replaced before it went out, and marks one replaced afterwards', async () => {
@@ -133,10 +178,19 @@ describe('telegram mirror', () => {
     store.insertDraft({ id: 'bb', thread_id: THREAD, peer: 'cu', question: 'second?', text: '' });
     await m.tick();
     expect(tg.sent.map((x) => String(x.body.text))).toEqual([expect.stringContaining('second?')]);
-    expect(tg.sent[0].body.text).toContain('<i>Reply to this message to answer.</i>');
     store.resolveDraft('bb', 'superseded', 'agent');
     await m.tick();
     expect(String(tg.sent[1].body.text)).toMatch(/↪️ Replaced by a newer question$/);
+  });
+
+  it('puts the Send button under the last part of a long draft, and a reply to any part finds it', async () => {
+    const m = mirror();
+    store.insertDraft({ id: 'll', thread_id: THREAD, peer: 'cu', question: 'q', text: `${'a'.repeat(3000)}\n${'b'.repeat(3000)}` });
+    await m.tick();
+    expect(tg.sent).toHaveLength(2);
+    expect(tg.sent[0].body.reply_markup).toBeUndefined();
+    expect(tg.sent[1].body.reply_markup).toEqual({ inline_keyboard: [[{ text: '✅ Send', callback_data: 'c:ll' }]] });
+    expect([store.draftByPost(-1001, 101)?.id, store.draftByPost(-1001, 102)?.id]).toEqual(['ll', 'll']);
   });
 
   it('keeps its place on a transient failure and resumes from the same message', async () => {

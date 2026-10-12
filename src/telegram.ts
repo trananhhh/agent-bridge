@@ -89,35 +89,45 @@ export function formatPosts(m: LoggedMessage, to: string): Post[] {
 const OUTCOME: Partial<Record<DraftStatus, (by: string) => string>> = {
   answering: (by) => `⏳ ${by} answered — the reply is being written`,
   answered: (by) => `✅ Answered by ${by}`,
+  sent: (by) => `✅ Sent as written, confirmed by ${by}`,
   superseded: () => '↪️ Replaced by a newer question',
 };
 
-/** The agent's question to its owner, and how to answer it: reply here, or continue the session in Claude. */
-export function formatQuestion(d: Draft, self: string, owners: string): Post {
+/**
+ * The agent's question to its owner, with its draft answer if it has one, and how to answer: ✅ Send, a reply, or the
+ * session in Claude. A long draft is split; the last part carries the button and, later, the outcome.
+ */
+export function formatQuestion(d: Draft, self: string, owners: string): Post[] {
   const code = shortThreadId(d.thread_id);
   // Run on this machine, so in this machine's shell (PowerShell 5 has no &&).
   const resume = d.session_id ? `${d.cwd ? `cd "${d.cwd}"${process.platform === 'win32' ? ';' : ' &&'} ` : ''}claude --resume ${d.session_id}` : undefined;
   const question = d.question ?? '';
   const status = OUTCOME[d.status]?.(d.resolved_by ?? '?');
+  const how = d.text ? '✅ Send sends it as written. Or reply to this message: your reply goes to the agent, which answers again.' : 'Reply to this message to answer.';
+  const head = {
+    html: [`🙋 <b>${escapeHtml(self)} asks ${escapeHtml(owners)}</b>  <code>${escapeHtml(code)}</code>`, `Before answering ${escapeHtml(d.peer)}:`, markdownToTelegramHtml(question)].join('\n'),
+    plain: [`🙋 ${self} asks ${owners}  ${code}`, `Before answering ${d.peer}:`, question].join('\n'),
+  };
+  const foot = {
+    html: [`<i>${how}</i>`, ...(resume ? [`<i>Or continue in Claude:</i> <code>${escapeHtml(resume)}</code>`] : []), ...(status ? ['', status] : [])].join('\n'),
+    plain: [how, ...(resume ? [`Or continue in Claude: ${resume}`] : []), ...(status ? ['', status] : [])].join('\n'),
+  };
+  if (!d.text) return [{ html: `${head.html}\n\n${foot.html}`, plain: `${head.plain}\n\n${foot.plain}` }];
+  const parts = renderParts(d.text, Math.max(1000, CHUNK_CHARS - head.plain.length - foot.plain.length));
+  return parts.map((p, i) => {
+    const last = i === parts.length - 1;
+    const top = i === 0 ? { html: `${head.html}\n\n<b>Draft answer:</b>\n`, plain: `${head.plain}\n\nDraft answer:\n` } : { html: `<i>(${i + 1}/${parts.length})</i>  <code>${escapeHtml(code)}</code>\n\n`, plain: `(${i + 1}/${parts.length})  ${code}\n\n` };
+    return { html: `${top.html}${p.html}${last ? `\n\n${foot.html}` : ''}`, plain: `${top.plain}${p.plain}${last ? `\n\n${foot.plain}` : ''}` };
+  });
+}
+
+/** What the shared chat sees of a private question: that an answer is waiting, never what about. */
+export function formatWaiting(d: Draft, self: string, owners: string): Post {
+  const code = shortThreadId(d.thread_id);
+  const status = OUTCOME[d.status]?.(d.resolved_by ?? '?');
   return {
-    html: [
-      `🙋 <b>${escapeHtml(self)} asks ${escapeHtml(owners)}</b>  <code>${escapeHtml(code)}</code>`,
-      `Before answering ${escapeHtml(d.peer)}:`,
-      `${markdownToTelegramHtml(question)}`,
-      '',
-      resume
-        ? `<i>Reply to this message to answer, or continue in Claude:</i> <code>${escapeHtml(resume)}</code>`
-        : '<i>Reply to this message to answer.</i>',
-      ...(status ? ['', status] : []),
-    ].join('\n'),
-    plain: [
-      `🙋 ${self} asks ${owners}  ${code}`,
-      `Before answering ${d.peer}:`,
-      question,
-      '',
-      resume ? `Reply to this message to answer, or continue in Claude: ${resume}` : 'Reply to this message to answer.',
-      ...(status ? ['', status] : []),
-    ].join('\n'),
+    html: `⏳ <b>${escapeHtml(self)} → ${escapeHtml(d.peer)}</b>: waiting for ${escapeHtml(owners)} to answer  <code>${escapeHtml(code)}</code>${status ? `\n\n${status}` : ''}`,
+    plain: `⏳ ${self} → ${d.peer}: waiting for ${owners} to answer  ${code}${status ? `\n\n${status}` : ''}`,
   };
 }
 
@@ -177,8 +187,8 @@ export function createTelegramMirror(opts: {
   store: BridgeStore;
   selfName: string;
   target: TelegramTarget;
-  /** Who the agent's questions are for, as shown on them. */
-  owners?: () => string | undefined;
+  /** This machine's owners: whom the agent's questions are for (private ones go to them directly). */
+  owners?: () => { id: number; name: string }[];
   fetchImpl?: Fetch;
   log: (event: string, data?: Record<string, unknown>) => void;
   now?: () => number;
@@ -192,20 +202,20 @@ export function createTelegramMirror(opts: {
   const call = <T>(method: string, body: Record<string, unknown>) =>
     telegramCall<T>(target.botToken, method, { chat_id: target.chatId, ...body }, opts.fetchImpl);
 
-  /** Returns the id of the last Telegram message sent. */
-  const sendAll = async (posts: Post[], where: { chat?: string | number; lastExtra?: Record<string, unknown> } = {}): Promise<number> => {
-    let id = 0;
+  /** Returns the ids of the Telegram messages sent, in order. */
+  const sendAll = async (posts: Post[], where: { chat?: string | number; lastExtra?: Record<string, unknown> } = {}): Promise<number[]> => {
+    const ids: number[] = [];
     for (const [i, post] of posts.entries()) {
       const extra = { chat_id: where.chat ?? target.chatId, link_preview_options: { is_disabled: true }, ...(i === posts.length - 1 ? where.lastExtra : {}) };
       try {
-        id = (await call<{ message_id: number }>('sendMessage', { text: post.html, parse_mode: 'HTML', ...extra })).message_id;
+        ids.push((await call<{ message_id: number }>('sendMessage', { text: post.html, parse_mode: 'HTML', ...extra })).message_id);
       } catch (err) {
         if (!(err instanceof TelegramError && err.status === 400 && PARSE_ERROR.test(err.message))) throw err;
         opts.log('telegram_plain_fallback', { error: err.message });
-        id = (await call<{ message_id: number }>('sendMessage', { text: post.plain, ...extra })).message_id;
+        ids.push((await call<{ message_id: number }>('sendMessage', { text: post.plain, ...extra })).message_id);
       }
     }
-    return id;
+    return ids;
   };
 
   /** Runs one post; false means stop this tick and retry later. */
@@ -244,26 +254,40 @@ export function createTelegramMirror(opts: {
   };
 
   const postQuestions = async (): Promise<boolean> => {
-    const owners = opts.owners?.() || 'the owner';
+    const owners = opts.owners?.() ?? [];
+    const names = owners.map((o) => o.name).join(' / ') || 'the owner';
     for (const d of store.unpostedDrafts()) {
-      let posted = 0;
-      // A question replaced before it went out is never posted (0 marks it done).
-      if (d.status === 'pending' && !(await attempt(d.id, async () => void (posted = await sendAll([formatQuestion(d, opts.selfName, owners)]))))) return false;
-      store.setDraftPosted(d.id, posted);
-      if (!posted) store.setDraftShown(d.id, d.status);
+      // A question replaced before it went out is never posted.
+      if (d.status === 'pending') {
+        const posts = formatQuestion(d, opts.selfName, names);
+        const lastExtra = d.text ? { reply_markup: { inline_keyboard: [[{ text: '✅ Send', callback_data: `c:${d.id}` }]] } } : undefined;
+        if (d.private && !owners.length) opts.log('telegram_no_owner', { draft: d.id });
+        for (const chat of d.private ? owners.map((o) => o.id) : [target.chatId]) {
+          let ids: number[] = [];
+          if (!(await attempt(d.id, async () => void (ids = await sendAll(posts, { chat, lastExtra }))))) return false;
+          ids.forEach((id, i) => store.addDraftPost(d.id, chat, id, i === ids.length - 1 ? 'full' : 'part'));
+        }
+      }
+      store.setDraftPosted(d.id);
+      if (d.status === 'pending' && d.private) {
+        let ids: number[] = [];
+        if (!(await attempt(d.id, async () => void (ids = await sendAll([formatWaiting(d, opts.selfName, names)]))))) return false;
+        for (const id of ids) store.addDraftPost(d.id, target.chatId, id, 'notice');
+      }
     }
-    for (const d of store.draftsToRefresh()) {
-      const q = formatQuestion(d, opts.selfName, owners);
-      const ok = await attempt(d.id, async () => {
+    for (const p of store.draftPostsToRefresh()) {
+      const post = p.kind === 'notice' ? formatWaiting(p.draft, opts.selfName, names) : formatQuestion(p.draft, opts.selfName, names).at(-1)!;
+      const ok = await attempt(p.draft.id, async () => {
         try {
-          await call('editMessageText', { message_id: d.posted_message_id, text: q.html, parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+          // Without reply_markup, the edit also removes the Send button.
+          await call('editMessageText', { chat_id: p.chat_id, message_id: p.message_id, text: post.html, parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
         } catch (err) {
           // Already showing it, or the post is gone: nothing left to update.
           if (!(err instanceof TelegramError && err.status === 400)) throw err;
         }
       });
       if (!ok) return false;
-      store.setDraftShown(d.id, d.status);
+      store.setDraftPostShown(p.chat_id, p.message_id, p.draft.status);
     }
     return true;
   };
