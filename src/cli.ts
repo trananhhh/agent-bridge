@@ -507,7 +507,9 @@ async function registerOwner(bot: string, code: string): Promise<Owner | undefin
   console.log('Waiting up to 15 minutes…');
   for (const end = Date.now() + OWNER_WAIT_MS; Date.now() < end; ) {
     await new Promise((r) => setTimeout(r, 3000));
-    const added = (await api<{ owners: Owner[] }>('/local/telegram/owners')).owners.find((o) => !before.has(o.id));
+    // The daemon may be restarting (an update): keep waiting, the link stays valid.
+    const owners = await api<{ owners: Owner[] }>('/local/telegram/owners').then((r) => r.owners, () => []);
+    const added = owners.find((o) => !before.has(o.id));
     if (added) return added;
   }
   return undefined;
