@@ -435,6 +435,8 @@ const BOTFATHER_URL = 'https://t.me/BotFather';
 const addToChannelUrl = (bot: string) => `https://t.me/${bot}?startchannel&admin=post_messages`;
 const addToGroupUrl = (bot: string) => `https://t.me/${bot}?startgroup&admin=pin_messages`;
 const WAIT_ROUNDS = 48;
+/** The owner may need to find their phone. */
+const OWNER_WAIT_ROUNDS = 120;
 const ONE_BOT_PER_MACHINE = 'Each machine needs its own bot — two machines cannot read the same bot. Create one with @BotFather (/newbot).';
 
 interface TelegramChat {
@@ -500,7 +502,8 @@ async function waitForOwner(token: string, bot: string, offset?: number): Promis
   console.log(`\nOpen this link on your phone and tap Start — it tells @${bot} who you are, and opens the private chat`);
   console.log(`where it sends you the answers it wants you to check:\n  ${link}`);
   openUrl(link);
-  for (let i = 0; i < WAIT_ROUNDS; i++) {
+  console.log('Waiting up to 10 minutes…');
+  for (let i = 0; i < OWNER_WAIT_ROUNDS; i++) {
     const updates = await pollUpdates(token, 5, ['message'], offset);
     offset = nextOffset(updates, offset);
     const owner = findStart(updates, code);
