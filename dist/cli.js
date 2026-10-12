@@ -522,8 +522,15 @@ async function cmdTelegram(argv) {
         if (isGroup && !(await seesWholeGroup(token, bot.id, chat.id))) {
             console.log(`! @${bot.username} only sees replies to its own posts. Make it an admin of "${chat.title}" so replies to the other side's posts reach it too.`);
         }
-        const who = owner ? `${owner.name} can reply to any post here to answer; answers the agent wants checked go to ${owner.name} privately.` : '';
-        await telegramCall(token, 'sendMessage', { chat_id: chat.id, text: `agent-bridge: ${raw.name}'s agent posts what it sends and receives here. ${who}`.trim() });
+        // Announce only what changed, so running this again does not repeat itself in the chat.
+        const newChat = raw.telegram?.chatId !== chat.id;
+        if (newChat || owner) {
+            const who = owner ? `${owner.name} can reply to any post here to answer; answers the agent wants checked go to ${owner.name} privately.` : '';
+            await telegramCall(token, 'sendMessage', {
+                chat_id: chat.id,
+                text: (newChat ? `agent-bridge: ${raw.name}'s agent posts what it sends and receives here. ${who}` : `agent-bridge: ${who}`).trim(),
+            });
+        }
         raw.telegram = { botToken: token, chatId: chat.id, chatTitle: chat.title, owners: owner ? [owner] : [] };
         writeRawConfig(raw);
         if (owner) {
