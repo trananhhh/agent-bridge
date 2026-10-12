@@ -43,7 +43,7 @@ Talk to Claude Code as usual: *"ask Cu's agent whether the orders table has a pr
 
 - **To see colleagues' messages pop up in the conversation you have open:** start Claude with `claude-bridge` instead of `claude`. This adds `--dangerously-load-development-channels`, and you confirm a warning each launch, because Claude Code [channels](https://code.claude.com/docs/en/channels-reference) are in research preview.
 - **Regular sessions and the desktop app** work too. Claude polls `peer_inbox` for answers.
-- **When a colleague asks while you have no session open,** the daemon answers in a read-only session. If the question relates to one of your recent sessions (last 48h), it continues in that session.
+- **When a colleague asks while you have no session open,** the daemon answers in a read-only session. If the question relates to one of your recent sessions (last 48h), it continues in that session. With a Telegram group, you can step in or approve from your phone (see below).
 
 ## See what the agents said
 
@@ -55,15 +55,32 @@ Every message passes through both daemons, so **each side keeps the whole exchan
 
 Sessions that answer a colleague are named `⇄ <colleague>: <question>`. Sessions started with `claude -p` are left out of the `/resume` picker, so open them by id. In the session that asked, the question and the answer appear as the `ask_peer` and `peer_inbox` tool calls.
 
-### Telegram channel (read-only)
+### Telegram group: read along, answer, approve
 
-To follow along on your phone, run `agent-bridge telegram` (the first-run wizard offers it too):
+Run `agent-bridge telegram` (the first-run wizard offers it too):
 
-1. **Bot.** Paste a token, or press Enter: the CLI opens @BotFather, where you send `/newbot` and copy the token.
-2. **Channel.** The CLI opens `t.me/<bot>?startchannel&admin=post_messages`. Pick your channel or create one, then confirm. That adds the bot as an admin that can post, and the CLI picks the channel up by itself. A group works too: use `?startgroup`. If the bot is already in the chat, post `@<bot> hi` there so the CLI can find it.
-3. The CLI then prints `agent-bridge telegram --token=… --chat=…`. Send it privately to colleagues who should post to the same channel.
+1. **Bot.** Each machine needs **its own** bot: Telegram lets only one program read a bot's messages. The CLI opens @BotFather; send `/newbot` and paste the token.
+2. **Group.** The CLI opens `t.me/<bot>?startgroup&admin=pin_messages`. Pick the group (or create one) and confirm, which adds the bot as an admin. Bot already in the group? Post `@<bot> hi` there, or pass `--chat=<id>`.
+3. **You.** The CLI prints a one-time link, `t.me/<bot>?start=<code>`. Open it and tap Start. That tells the bot **who you are** (only your replies and button presses act for your machine) and opens your private chat with it, where it sends you answers to check. Only someone at the terminal sees the code.
+4. The bot needs to be an **admin** to see replies to the other side's posts. The CLI warns you if it isn't.
 
-**Each machine posts the messages it sends**, so every message appears once, whether one side or both sides mirror. If the sender doesn't mirror to the same channel, the receiver posts the message instead. Messages leave your Tailscale network and are stored by Telegram. The mirror keeps its place across restarts and Telegram outages. To stop it, run `agent-bridge telegram off`.
+What happens in the group:
+
+- **Every message is posted once**, rendered from the agents' Markdown (bold, lists, code, tables as aligned text). Each side posts what it sends. If the sender doesn't post to this group, the receiver does.
+- **Reply to any post to answer in your own words.** If the post is a question to your machine that is still waiting, your text is the answer, and an answer the agent finishes afterwards is held back instead of being sent too. Otherwise your text goes to the other side as a follow-up. The other agent sees it was written by a person, and your message gets a 👍 once it's on its way.
+- **The agent hands you what it shouldn't decide alone.** It holds back an answer that would commit you to something you haven't clearly agreed to (a final amount, a payment, a deal, a deadline), or that only you can know. The held answer goes to **your private chat with the bot**, with **✅ Send** and **🚫 Don't send** buttons; reply to it to send your own answer instead. The group only sees that an answer is waiting for you, because the other side reads the group too. Nothing reaches them until you decide. The next time the agent answers on that thread, it is told what you wrote and decided.
+
+Messages leave your Tailscale network and are stored by Telegram. The mirror keeps its place across restarts and outages. To stop it, run `agent-bridge telegram off`. A channel also works, read-only, for people who should only read.
+
+### Which models answer
+
+Answering sessions run **`opus`** by default, pinned explicitly. `--restricted` ignores the model in your Claude Code settings, and a resumed session would otherwise keep whatever model it last ran. The router that picks which recent session a question belongs to runs **`haiku`**. Both are set in `~/.agent-bridge/config.json`:
+
+```json
+"routing": { "answerModel": "opus", "answerEffort": "xhigh", "classifierModel": "haiku" }
+```
+
+`answerEffort` is one of `low`, `medium`, `high`, `xhigh` or `max`; leave it out to use the model's default. Messages a colleague's agent sends within 10 seconds of each other on one thread get **one** answer that covers them all. Questions that arrived just before the daemon restarted are still answered once it is back.
 
 ## Permissions
 
@@ -82,7 +99,7 @@ agent-bridge note <name>     print the Claude Code note again
 agent-bridge folders <name>  change which folders that person can read
 agent-bridge remove <name>   disconnect
 agent-bridge log [thread]    what the agents said to each other (-f: keep watching)
-agent-bridge telegram [off]  post every message to a read-only Telegram channel
+agent-bridge telegram [off]  post every message to a Telegram group; answer and approve from there
 agent-bridge status          daemon + each connection online/offline
 agent-bridge uninstall       stop the daemon, remove the MCP server
 ```

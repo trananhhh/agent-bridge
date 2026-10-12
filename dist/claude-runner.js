@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { claudeInvocation } from "./platform.js";
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const STDOUT_CAP = 5 * 1024 * 1024;
 export const READ_ONLY_TOOLS = 'Read,Grep,Glob,WebSearch';
 const WRITE_TOOLS = 'Edit,Write,NotebookEdit';
@@ -16,6 +17,8 @@ export function buildClaudeArgs(opts) {
         args.push('-n', opts.name);
     if (opts.model)
         args.push('--model', opts.model);
+    if (opts.effort)
+        args.push('--effort', opts.effort);
     if (opts.noTools)
         args.push('--tools=');
     if (opts.readOnlyDirs) {

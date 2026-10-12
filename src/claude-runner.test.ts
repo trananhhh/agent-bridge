@@ -26,6 +26,10 @@ describe('buildClaudeArgs', () => {
     ]);
   });
 
+  it('pins the model and effort, since --restricted ignores the model in the user settings', () => {
+    expect(buildClaudeArgs({ resumeSessionId: 's1', model: 'opus', effort: 'xhigh' }).slice(-6)).toEqual(['--resume', 's1', '--model', 'opus', '--effort', 'xhigh']);
+  });
+
   it('names the session so its owner can find it later', () => {
     expect(buildClaudeArgs({ name: '⇄ cu: does orders have provider_id?' }).slice(-2)).toEqual(['-n', '⇄ cu: does orders have provider_id?']);
   });

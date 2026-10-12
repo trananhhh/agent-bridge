@@ -22,6 +22,41 @@ function sessionTitle(peer, question) {
 const headlessSystemPrompt = (peer) => `You are answering a message from ${peer}'s Claude Code agent via agent-bridge; nobody is at this machine. ` +
     'You can only READ the folders shared with this person. You cannot write anything; if the request needs writing, editing or running commands, ' +
     'say exactly what is needed and that the owner of this machine must do it themselves. Your final answer is sent verbatim to the other agent.';
+const HAND_OFF = '[[ASK_OWNER]]';
+const ownerReviewPrompt = (owners) => `\n\nThe owner of this machine (${owners}) follows this conversation in Telegram and can answer for themselves. ` +
+    `Do not commit them to anything they have not clearly agreed to in what you can read (a final amount, a payment, a deal, a deadline, a promise), ` +
+    `and do not guess what only they can know. In those cases make the very first line of your reply exactly "${HAND_OFF} " followed by a short question for ${owners} ` +
+    `in the language of the conversation, then write the answer you would send if they agree. They see it with Send / Don't send buttons; ` +
+    'nothing reaches the other side until they decide. Otherwise answer normally.';
+const QUESTION_MAX = 1000;
+/** Fails closed: the marker anywhere, however formatted, holds the answer. Its line is the question; the rest is the draft. */
+function parseHandOff(text) {
+    const lines = text.split('\n');
+    const at = lines.findIndex((l) => l.includes(HAND_OFF));
+    if (at === -1)
+        return undefined;
+    const question = lines[at].replace(HAND_OFF, '').replace(/[*_`~#>]/g, '').trim() || 'OK to send?';
+    return {
+        question: question.length > QUESTION_MAX ? `${question.slice(0, QUESTION_MAX - 1)}…` : question,
+        draft: [...lines.slice(0, at), ...lines.slice(at + 1)].join('\n').trim(),
+    };
+}
+const ownerWrote = (owner) => `[${owner} (the person, not an agent) wrote this in Telegram]\n\n`;
+const ownerApproved = (owner) => `[Checked and approved by ${owner} before sending]\n\n`;
+const OWNER_WROTE = /^\[[^\]\n]* \(the person, not an agent\) wrote this in Telegram\]\n\n/;
+const DRAFT_FATE = {
+    sent: 'sent as written',
+    dropped: 'not sent',
+    replaced: 'not sent — they answered in their own words',
+    superseded: 'replaced by a later held answer',
+};
+const OWNER_CONTEXT_MAX = 6;
+const clip = (text, max) => {
+    const flat = text.replace(/\s+/g, ' ').trim();
+    return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
+/** An ask still unanswered after this long is not picked up again at startup. */
+const RECOVER_WINDOW_MS = 24 * 3600_000;
 const LocalSendSchema = z.object({
     kind: z.enum(['ask', 'reply']),
     text: z.string().min(1).max(32_000),
@@ -40,6 +75,11 @@ export function createDaemon(opts) {
     const live = new Map();
     const pending = new Set();
     const queues = new Map();
+    /** Asks waiting to be answered together, per thread; ownerSeen = owner replies on the thread already counted when the batch began. */
+    const batches = new Map();
+    /** Per thread: how many times the owner has replied there, to hold back answers that the owner overtook. */
+    const ownerReplies = new Map();
+    const review = opts.ownerReview;
     const track = (p) => {
         pending.add(p);
         p.finally(() => pending.delete(p)).catch(() => { });
@@ -83,7 +123,7 @@ export function createDaemon(opts) {
             sent_at: new Date(now()).toISOString(),
             ...(opts.mirrorChat ? { mirror: opts.mirrorChat } : {}),
         };
-        store.insertMessage(msg, 'out');
+        store.insertMessage(msg, 'out', input.via);
         store.upsertThread({
             thread_id: msg.thread_id,
             origin: input.threadId ? undefined : 'local',
@@ -182,40 +222,113 @@ export function createDaemon(opts) {
         log('classified', { thread: msg.thread_id, from: peer.name, choice });
         return { target: resolveTarget(choice, lives), candidates };
     }
-    async function runHeadless(msg, peer, resume) {
+    function holdForOwner(threadId, peer, question, text) {
+        store.settlePendingDrafts(threadId, 'superseded', 'agent');
+        const id = randomBytes(4).toString('hex');
+        store.insertDraft({ id, thread_id: threadId, peer: peer.name, question, text });
+        log('held_for_owner', { thread: threadId, draft: id, asked: question !== undefined });
+    }
+    async function runHeadless(batch, peer, ownerSeen, resume) {
+        const threadId = batch[0].thread_id;
         const cwd = resume?.cwd && isWithin(resume.cwd, peer.folders) ? resume.cwd : peer.folders[0];
-        await serialize(resume?.sessionId ?? msg.thread_id, async () => {
+        await serialize(resume?.sessionId ?? threadId, async () => {
             let text;
             let sessionId;
-            log('headless_start', { thread: msg.thread_id, from: peer.name, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
+            let failed = false;
+            log('headless_start', { thread: threadId, from: peer.name, parts: batch.length, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
             const run = (target) => opts.runner({
-                prompt: frameAsk(msg),
+                prompt: frameAsk(batch, review ? ownerContext(threadId) : []),
                 cwd,
                 resumeSessionId: target?.sessionId,
                 fork: target?.fork,
-                name: target && !target.fork ? undefined : sessionTitle(peer.name, msg.text),
+                name: target && !target.fork ? undefined : sessionTitle(peer.name, batch[0].text),
+                model: opts.answerModel,
+                effort: opts.answerEffort,
                 readOnlyDirs: peer.folders,
-                appendSystemPrompt: headlessSystemPrompt(peer.name),
+                appendSystemPrompt: headlessSystemPrompt(peer.name) + (review ? ownerReviewPrompt(review.owners) : ''),
                 timeoutMs: opts.headlessTimeoutMs,
             });
             try {
                 const res = await run(resume).catch((err) => {
                     if (!resume)
                         throw err;
-                    log('resume_failed', { thread: msg.thread_id, resume: resume.sessionId, error: err.message });
+                    log('resume_failed', { thread: threadId, resume: resume.sessionId, error: err.message });
                     return run();
                 });
                 sessionId = res.sessionId || undefined;
+                failed = res.isError;
                 text = res.isError ? `[agent-bridge] ${opts.name}'s session reported an error: ${res.result}` : res.result.trim() || '(empty answer)';
             }
             catch (err) {
+                failed = true;
                 text = `[agent-bridge] ${opts.name}'s agent failed to answer: ${err.message}`;
-                log('headless_failed', { thread: msg.thread_id, error: err.message });
+                log('headless_failed', { thread: threadId, error: err.message });
             }
-            store.markDelivered([msg.id]);
-            store.upsertThread({ thread_id: msg.thread_id, origin: 'remote', peer: peer.name, session_id: sessionId, cwd });
-            await send({ kind: 'reply', text, threadId: msg.thread_id, sessionId });
+            store.markDelivered(batch.map((m) => m.id));
+            store.upsertThread({ thread_id: threadId, origin: 'remote', peer: peer.name, session_id: sessionId, cwd });
+            if (review) {
+                const overtaken = (ownerReplies.get(threadId) ?? 0) > ownerSeen;
+                if (overtaken)
+                    return failed ? log('answer_discarded', { thread: threadId, reason: 'owner replied first' }) : holdForOwner(threadId, peer, undefined, text);
+                const handOff = failed ? undefined : parseHandOff(text);
+                if (handOff)
+                    return holdForOwner(threadId, peer, handOff.question, handOff.draft);
+            }
+            await send({ kind: 'reply', text, threadId, sessionId });
         });
+    }
+    /** What the owner said and decided on this thread in Telegram, which the answering session has not otherwise seen. */
+    function ownerContext(threadId) {
+        const events = [];
+        for (const m of store.threadMessages(threadId)) {
+            if (m.via && OWNER_WROTE.test(m.text))
+                events.push({ at: m.received_at, line: `- they wrote to ${m.kind === 'ask' ? 'ask' : 'answer'}: "${clip(m.text.replace(OWNER_WROTE, ''), 500)}"` });
+        }
+        for (const d of store.threadDrafts(threadId)) {
+            if (d.status !== 'pending')
+                events.push({ at: d.created_at, line: `- your held answer "${clip(d.text, 160)}" was ${DRAFT_FATE[d.status]}` });
+        }
+        if (!events.length)
+            return [];
+        const lines = events.sort((x, y) => x.at - y.at).slice(-OWNER_CONTEXT_MAX).map((e) => e.line);
+        return [`${review.owners}, the owner of this machine, acted on this thread in Telegram (oldest first) — take it into account:`, ...lines];
+    }
+    /** Asks arriving in a burst on one thread are answered once, together; a thread's answers never run concurrently. */
+    function answerLater(msg, peer) {
+        const waiting = batches.get(msg.thread_id);
+        if (waiting) {
+            waiting.msgs.push(msg);
+            return Promise.resolve();
+        }
+        const batch = { msgs: [msg], ownerSeen: ownerReplies.get(msg.thread_id) ?? 0 };
+        batches.set(msg.thread_id, batch);
+        return serialize(`thread:${msg.thread_id}`, async () => {
+            if (opts.coalesceMs)
+                await new Promise((r) => setTimeout(r, opts.coalesceMs));
+            batches.delete(msg.thread_id);
+            await answer(batch.msgs, peer, batch.ownerSeen);
+        });
+    }
+    async function answer(batch, peer, ownerSeen) {
+        const thread = store.getThread(batch[0].thread_id);
+        const route = routeInbound(batch[0], thread, new Set(live.keys()));
+        if (route.type === 'deliver-live')
+            batch = batch.filter((m) => !pushLive(route.connId, m));
+        if (!batch.length)
+            return;
+        if (thread?.session_id)
+            return runHeadless(batch, peer, ownerSeen, { sessionId: thread.session_id, cwd: thread.cwd });
+        const { target, candidates } = await classify({ thread_id: batch[0].thread_id, text: batch.map((m) => m.text).join('\n\n') }, peer);
+        if (target.type === 'deliver-live')
+            batch = batch.filter((m) => !pushLive(target.connId, m));
+        if (!batch.length)
+            return;
+        if (target.type === 'resume') {
+            const c = candidates.find((x) => x.sessionId === target.sessionId);
+            const fork = c ? now() - c.mtimeMs < opts.activeWindowMs : false;
+            return runHeadless(batch, peer, ownerSeen, { sessionId: target.sessionId, cwd: c?.cwd, fork });
+        }
+        return runHeadless(batch, peer, ownerSeen);
     }
     async function handleInbound(msg, peer) {
         const route = routeInbound(msg, store.getThread(msg.thread_id), new Set(live.keys()));
@@ -226,17 +339,63 @@ export function createDaemon(opts) {
             log('parked_reply', { id: msg.id, thread: msg.thread_id });
             return;
         }
-        if (route.type === 'resume')
-            return runHeadless(msg, peer, { sessionId: route.sessionId, cwd: route.cwd });
-        const { target, candidates } = await classify(msg, peer);
-        if (target.type === 'deliver-live' && pushLive(target.connId, msg))
-            return;
-        if (target.type === 'resume') {
-            const c = candidates.find((x) => x.sessionId === target.sessionId);
-            const fork = c ? now() - c.mtimeMs < opts.activeWindowMs : false;
-            return runHeadless(msg, peer, { sessionId: target.sessionId, cwd: c?.cwd, fork });
+        return answerLater(msg, peer);
+    }
+    async function ownerReply(input) {
+        const { threadId } = input;
+        // A thread whose first answer is still being written has no thread record yet: its asker is the peer.
+        const to = store.getThread(threadId)?.peer ?? store.threadMessages(threadId).find((m) => m.direction === 'in')?.from;
+        const peer = resolvePeer({ kind: 'reply', text: input.text, threadId, to });
+        const last = store.lastMessage(threadId);
+        const settled = store.settlePendingDrafts(threadId, 'replaced', input.owner);
+        const answering = settled.length > 0 || (last?.direction === 'in' && last.kind === 'ask');
+        ownerReplies.set(threadId, (ownerReplies.get(threadId) ?? 0) + 1);
+        log('owner_reply', { thread: threadId, kind: answering ? 'reply' : 'ask', replaced: settled });
+        try {
+            return await send({
+                kind: answering ? 'reply' : 'ask',
+                text: ownerWrote(input.owner) + input.text,
+                threadId,
+                to: peer.name,
+                via: input.seenInChat ? 'owner-in-chat' : 'owner',
+            });
         }
-        return runHeadless(msg, peer);
+        catch (err) {
+            for (const id of settled)
+                store.reopenDraft(id);
+            throw err;
+        }
+    }
+    async function resolveDraft(id, action, owner) {
+        const draft = store.getDraft(id);
+        if (!draft)
+            return 'not found';
+        if (action === 'send' && !draft.text)
+            return 'nothing to send';
+        if (action === 'send' && !store.getPeer(draft.peer))
+            throw new Error(`not connected to ${draft.peer} any more`);
+        if (!store.resolveDraft(id, action === 'send' ? 'sent' : 'dropped', owner))
+            return 'already handled';
+        log(action === 'send' ? 'draft_sent' : 'draft_dropped', { thread: draft.thread_id, draft: id, by: owner });
+        if (action === 'drop')
+            return 'dropped';
+        try {
+            await send({ kind: 'reply', text: ownerApproved(owner) + draft.text, threadId: draft.thread_id, to: draft.peer, via: 'owner' });
+        }
+        catch (err) {
+            store.reopenDraft(id);
+            throw err;
+        }
+        return 'sent';
+    }
+    function recover() {
+        for (const msg of store.unansweredAsks(now() - RECOVER_WINDOW_MS)) {
+            const peer = store.getPeer(msg.from);
+            if (!peer)
+                continue;
+            log('recovered_ask', { id: msg.id, thread: msg.thread_id, from: peer.name });
+            track(answerLater(msg, peer).catch((err) => log('inbound_failed', { id: msg.id, error: err.message })));
+        }
     }
     function registerLive(conn) {
         live.set(conn.connId, conn);
@@ -435,7 +594,15 @@ export function createDaemon(opts) {
             return c.json({ error: `no peer named "${parsed.data.name}"` }, 404);
         return c.json({ removed: parsed.data.name });
     });
-    localApp.get('/local/threads', (c) => c.json({ threads: store.listThreads(Math.min(Number(c.req.query('limit')) || 30, 500)) }));
+    // A thread whose first answer is still being written has no thread record yet; who started it tells the direction.
+    localApp.get('/local/threads', (c) => c.json({
+        threads: store.listThreads(Math.min(Number(c.req.query('limit')) || 30, 500)).map((t) => {
+            if (t.origin)
+                return t;
+            const mine = t.first_sender === opts.name;
+            return { ...t, origin: mine ? 'local' : 'remote', peer: t.peer ?? (mine ? undefined : t.first_sender) };
+        }),
+    }));
     localApp.get('/local/threads/:id', (c) => {
         const ids = store.findThreadIds(c.req.param('id'));
         if (ids.length === 0)
@@ -513,6 +680,9 @@ export function createDaemon(opts) {
         localApp,
         registerLive,
         send,
+        ownerReply: (input) => track(ownerReply(input)),
+        resolveDraft: (id, action, owner) => track(resolveDraft(id, action, owner)),
+        recover,
         flushOutbox,
         idle: async () => {
             while (pending.size > 0)
@@ -520,14 +690,17 @@ export function createDaemon(opts) {
         },
     };
 }
-function frameAsk(msg) {
+function frameAsk(batch, ownerContext) {
+    const [first] = batch;
     return [
-        `[agent-bridge] Message from ${msg.from}'s Claude Code agent (thread ${msg.thread_id}).`,
-        'They are a trusted colleague; below is their question or request.',
+        `[agent-bridge] Message from ${first.from}'s Claude Code agent (thread ${first.thread_id}).`,
+        batch.length > 1
+            ? `They are a trusted colleague; they sent ${batch.length} messages in a row — answer them together, in one reply.`
+            : 'They are a trusted colleague; below is their question or request.',
         'Answer concisely and to the point. Your final answer is sent back to them verbatim.',
+        ...(ownerContext.length ? ['', ...ownerContext] : []),
         '',
-        '---',
-        msg.text,
+        ...batch.flatMap((m) => ['---', m.text]),
     ].join('\n');
 }
 function safeEqual(a, b) {

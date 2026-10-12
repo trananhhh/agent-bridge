@@ -54,6 +54,19 @@ export class BridgeStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS drafts (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        peer TEXT NOT NULL,
+        question TEXT,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL,
+        resolved_by TEXT,
+        posted_message_id INTEGER,
+        shown_status TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS drafts_thread ON drafts (thread_id, status);
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -66,13 +79,75 @@ export class BridgeStore {
         const columns = this.db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name);
         if (!columns.includes('mirror'))
             this.db.exec('ALTER TABLE messages ADD COLUMN mirror TEXT');
+        if (!columns.includes('via'))
+            this.db.exec('ALTER TABLE messages ADD COLUMN via TEXT');
     }
-    insertMessage(m, direction) {
+    insertMessage(m, direction, via) {
         const res = this.db
-            .prepare(`INSERT OR IGNORE INTO messages (id, thread_id, direction, sender, kind, text, sent_at, received_at, mirror)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-            .run(m.id, m.thread_id, direction, m.from, m.kind, m.text, m.sent_at, Date.now(), m.mirror ?? null);
+            .prepare(`INSERT OR IGNORE INTO messages (id, thread_id, direction, sender, kind, text, sent_at, received_at, mirror, via)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(m.id, m.thread_id, direction, m.from, m.kind, m.text, m.sent_at, Date.now(), m.mirror ?? null, via ?? null);
         return Number(res.changes) > 0;
+    }
+    lastMessage(threadId) {
+        const row = this.db.prepare('SELECT rowid AS seq, * FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1').get(threadId);
+        return row ? toLogged(row) : undefined;
+    }
+    insertDraft(d) {
+        this.db
+            .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)`)
+            .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, Date.now());
+    }
+    getDraft(id) {
+        const row = this.db.prepare('SELECT * FROM drafts WHERE id = ?').get(id);
+        return row ? toDraft(row) : undefined;
+    }
+    pendingDraft(threadId) {
+        const row = this.db
+            .prepare("SELECT * FROM drafts WHERE thread_id = ? AND status = 'pending' ORDER BY created_at DESC, rowid DESC LIMIT 1")
+            .get(threadId);
+        return row ? toDraft(row) : undefined;
+    }
+    draftByPost(messageId) {
+        const row = this.db.prepare('SELECT * FROM drafts WHERE posted_message_id = ?').get(messageId);
+        return row ? toDraft(row) : undefined;
+    }
+    /** Moves a pending draft to `status`. False when it was no longer pending, so two clicks never send twice. */
+    resolveDraft(id, status, by) {
+        return Number(this.db.prepare("UPDATE drafts SET status = ?, resolved_by = ? WHERE id = ? AND status = 'pending'").run(status, by, id).changes) > 0;
+    }
+    /** Settles every pending draft on a thread; returns their ids. */
+    settlePendingDrafts(threadId, status, by) {
+        const ids = this.db.prepare("SELECT id FROM drafts WHERE thread_id = ? AND status = 'pending' ORDER BY created_at, rowid").all(threadId).map((r) => String(r.id));
+        for (const id of ids)
+            this.resolveDraft(id, status, by);
+        return ids;
+    }
+    reopenDraft(id) {
+        this.db.prepare("UPDATE drafts SET status = 'pending', resolved_by = NULL WHERE id = ?").run(id);
+    }
+    threadDrafts(threadId) {
+        return this.db.prepare('SELECT * FROM drafts WHERE thread_id = ? ORDER BY created_at, rowid').all(threadId).map(toDraft);
+    }
+    /** Asks received since `sinceMs` that were never answered nor handed to a session (e.g. the daemon restarted first). */
+    unansweredAsks(sinceMs) {
+        const rows = this.db
+            .prepare("SELECT * FROM messages WHERE direction = 'in' AND kind = 'ask' AND delivered = 0 AND received_at >= ? ORDER BY rowid")
+            .all(sinceMs);
+        return rows.map(toMessage);
+    }
+    unpostedDrafts() {
+        return this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NULL ORDER BY created_at, rowid').all().map(toDraft);
+    }
+    setDraftPosted(id, messageId) {
+        this.db.prepare("UPDATE drafts SET posted_message_id = ?, shown_status = 'pending' WHERE id = ?").run(messageId, id);
+    }
+    /** Posted drafts whose status changed since their post was last updated. */
+    draftsToRefresh() {
+        return this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NOT NULL AND status != shown_status ORDER BY created_at, rowid').all().map(toDraft);
+    }
+    setDraftShown(id, status) {
+        this.db.prepare('UPDATE drafts SET shown_status = ? WHERE id = ?').run(status, id);
     }
     markDelivered(ids) {
         const stmt = this.db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?');
@@ -272,7 +347,29 @@ function toRequest(r) {
     return req;
 }
 function toLogged(r) {
-    return { ...toMessage(r), seq: Number(r.seq), direction: r.direction, received_at: Number(r.received_at) };
+    const m = { ...toMessage(r), seq: Number(r.seq), direction: r.direction, received_at: Number(r.received_at) };
+    if (r.via)
+        m.via = r.via;
+    return m;
+}
+function toDraft(r) {
+    const d = {
+        id: String(r.id),
+        thread_id: String(r.thread_id),
+        peer: String(r.peer),
+        text: String(r.text),
+        status: r.status,
+        created_at: Number(r.created_at),
+    };
+    if (r.question !== null)
+        d.question = String(r.question);
+    if (r.resolved_by !== null)
+        d.resolved_by = String(r.resolved_by);
+    if (r.posted_message_id !== null)
+        d.posted_message_id = Number(r.posted_message_id);
+    if (r.shown_status !== null)
+        d.shown_status = r.shown_status;
+    return d;
 }
 function toMessage(r) {
     const m = {

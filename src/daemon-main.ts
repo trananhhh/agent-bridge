@@ -11,9 +11,12 @@ import { BridgeStore } from './store.ts';
 import { notify, removePidFile, writePidFile } from './platform.ts';
 import { tailscaleWhois } from './tailscale.ts';
 import { createTelegramMirror } from './telegram.ts';
+import { createTelegramInbox } from './telegram-inbox.ts';
 
 const OUTBOX_INTERVAL_MS = 30_000;
 const MIRROR_INTERVAL_MS = 3_000;
+/** Agents often send one question as several messages a few seconds apart. */
+const COALESCE_MS = 10_000;
 const PROJECTS_ROOT = join(homedir(), '.claude', 'projects');
 
 /** Background launchers without stdio redirection (Windows Startup) pass --log. */
@@ -33,6 +36,9 @@ export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> 
   const cfg = loadConfig();
   const store = new BridgeStore(DB_PATH);
   const publicUrl = `http://${cfg.listenHost}:${cfg.peerPort}`;
+  const log = (event: string, data?: Record<string, unknown>) => console.error(JSON.stringify({ t: new Date().toISOString(), event, ...data }));
+  const owners = cfg.telegram?.owners ?? [];
+  const ownerNames = owners.map((o) => o.name).join(' / ');
 
   const daemon = createDaemon({
     name: cfg.name,
@@ -45,11 +51,16 @@ export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> 
     headlessTimeoutMs: cfg.headlessTimeoutMs,
     activeWindowMs: cfg.routing.activeWindowMin * 60_000,
     classifierModel: cfg.routing.classifierModel,
+    answerModel: cfg.routing.answerModel,
+    answerEffort: cfg.routing.answerEffort,
     mirrorChat: cfg.telegram ? String(cfg.telegram.chatId) : undefined,
+    ownerReview: owners.length ? { owners: ownerNames } : undefined,
+    coalesceMs: COALESCE_MS,
     whois: tailscaleWhois,
     notify,
   });
 
+  daemon.recover();
   const peerServer = serve({ fetch: daemon.peerApp.fetch, hostname: cfg.listenHost, port: cfg.peerPort });
   const localServer = serve({ fetch: daemon.localApp.fetch, hostname: '127.0.0.1', port: cfg.localPort });
   writePidFile(BRIDGE_HOME);
@@ -59,19 +70,27 @@ export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> 
   }, OUTBOX_INTERVAL_MS);
 
   const mirror = cfg.telegram
-    ? createTelegramMirror({
-        store,
-        selfName: cfg.name,
-        target: cfg.telegram,
-        log: (event, data) => console.error(JSON.stringify({ t: new Date().toISOString(), event, ...data })),
-      })
+    ? createTelegramMirror({ store, selfName: cfg.name, target: cfg.telegram, owners: ownerNames, reviewChat: owners[0]?.id, log })
     : undefined;
   const mirrorTimer = mirror && setInterval(() => void mirror.tick(), MIRROR_INTERVAL_MS);
+  const inbox =
+    cfg.telegram && owners.length
+      ? createTelegramInbox({ store, target: cfg.telegram, owners, actions: daemon, log, afterAction: () => void mirror?.tick() })
+      : undefined;
+  let stopping = false;
+  void (async () => {
+    while (inbox && !stopping) {
+      const wait = await inbox.pollOnce();
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+    }
+  })();
 
   console.error(
     JSON.stringify({
       event: 'started',
       telegram: cfg.telegram?.chatTitle ?? cfg.telegram?.chatId,
+      owners: ownerNames || undefined,
+      answer: [cfg.routing.answerModel, cfg.routing.answerEffort].filter(Boolean).join(' '),
       version: VERSION,
       name: cfg.name,
       url: publicUrl,
@@ -79,7 +98,6 @@ export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> 
     }),
   );
 
-  let stopping = false;
   const shutdown = async (signal: string) => {
     if (stopping) return;
     stopping = true;

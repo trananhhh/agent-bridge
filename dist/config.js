@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { EFFORTS } from "./claude-runner.js";
 /** Package root — works from src/ (dev) and dist/ (installed). */
 export const PACKAGE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const VERSION = JSON.parse(readFileSync(join(PACKAGE_DIR, 'package.json'), 'utf8')).version;
@@ -22,14 +23,19 @@ const ConfigSchema = z.object({
         recentLimit: z.number().int().positive().default(8),
         activeWindowMin: z.number().nonnegative().default(10),
         classifierModel: z.string().default('haiku'),
+        /** Pinned explicitly: --restricted ignores the user's settings, and a resumed session would otherwise keep whatever model it last ran. */
+        answerModel: z.string().default('opus'),
+        answerEffort: z.enum(EFFORTS).optional(),
     })
         .prefault({}),
-    /** Read-only mirror of every exchange into a Telegram channel (set up with `agent-bridge telegram`). */
+    /** Every exchange is posted to a Telegram chat; its owners can answer, approve and correct from there (set up with `agent-bridge telegram`). */
     telegram: z
         .object({
         botToken: z.string().min(1),
         chatId: z.union([z.number(), z.string().min(1)]),
         chatTitle: z.string().optional(),
+        /** Telegram users who speak for this machine in that chat. Nobody else's replies or button presses are acted on. */
+        owners: z.array(z.object({ id: z.number().int(), name: z.string().min(1).max(100) })).default([]),
     })
         .optional(),
 });

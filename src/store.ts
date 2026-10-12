@@ -41,6 +41,32 @@ export interface LoggedMessage extends PeerMessage {
   seq: number;
   direction: 'in' | 'out';
   received_at: number;
+  via?: MessageVia;
+}
+
+/**
+ * Written or approved by this machine's owner (in Telegram), not by the agent on its own.
+ * 'owner-in-chat': typed in the shared chat, so it is already visible there.
+ */
+export type MessageVia = 'owner' | 'owner-in-chat';
+
+export type DraftStatus = 'pending' | 'sent' | 'dropped' | 'replaced' | 'superseded';
+
+/** An answer held back for the owner to send, drop or replace. */
+export interface Draft {
+  id: string;
+  thread_id: string;
+  peer: string;
+  /** What the agent asks the owner; absent when held because the owner had already answered. */
+  question?: string;
+  text: string;
+  status: DraftStatus;
+  resolved_by?: string;
+  /** Telegram message carrying the buttons, once posted. */
+  posted_message_id?: number;
+  /** Status last shown on that post. */
+  shown_status?: DraftStatus;
+  created_at: number;
 }
 
 export interface ThreadSummary {
@@ -112,6 +138,19 @@ export class BridgeStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS drafts (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        peer TEXT NOT NULL,
+        question TEXT,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL,
+        resolved_by TEXT,
+        posted_message_id INTEGER,
+        shown_status TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS drafts_thread ON drafts (thread_id, status);
       CREATE TABLE IF NOT EXISTS outbox (
         id TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
@@ -123,16 +162,94 @@ export class BridgeStore {
     `);
     const columns = (this.db.prepare('PRAGMA table_info(messages)').all() as Row[]).map((c) => c.name);
     if (!columns.includes('mirror')) this.db.exec('ALTER TABLE messages ADD COLUMN mirror TEXT');
+    if (!columns.includes('via')) this.db.exec('ALTER TABLE messages ADD COLUMN via TEXT');
   }
 
-  insertMessage(m: PeerMessage, direction: 'in' | 'out'): boolean {
+  insertMessage(m: PeerMessage, direction: 'in' | 'out', via?: MessageVia): boolean {
     const res = this.db
       .prepare(
-        `INSERT OR IGNORE INTO messages (id, thread_id, direction, sender, kind, text, sent_at, received_at, mirror)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO messages (id, thread_id, direction, sender, kind, text, sent_at, received_at, mirror, via)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(m.id, m.thread_id, direction, m.from, m.kind, m.text, m.sent_at, Date.now(), m.mirror ?? null);
+      .run(m.id, m.thread_id, direction, m.from, m.kind, m.text, m.sent_at, Date.now(), m.mirror ?? null, via ?? null);
     return Number(res.changes) > 0;
+  }
+
+  lastMessage(threadId: string): LoggedMessage | undefined {
+    const row = this.db.prepare('SELECT rowid AS seq, * FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1').get(threadId) as Row | undefined;
+    return row ? toLogged(row) : undefined;
+  }
+
+  insertDraft(d: Pick<Draft, 'id' | 'thread_id' | 'peer' | 'question' | 'text'>): void {
+    this.db
+      .prepare(`INSERT INTO drafts (id, thread_id, peer, question, text, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)`)
+      .run(d.id, d.thread_id, d.peer, d.question ?? null, d.text, Date.now());
+  }
+
+  getDraft(id: string): Draft | undefined {
+    const row = this.db.prepare('SELECT * FROM drafts WHERE id = ?').get(id) as Row | undefined;
+    return row ? toDraft(row) : undefined;
+  }
+
+  pendingDraft(threadId: string): Draft | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM drafts WHERE thread_id = ? AND status = 'pending' ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .get(threadId) as Row | undefined;
+    return row ? toDraft(row) : undefined;
+  }
+
+  draftByPost(messageId: number): Draft | undefined {
+    const row = this.db.prepare('SELECT * FROM drafts WHERE posted_message_id = ?').get(messageId) as Row | undefined;
+    return row ? toDraft(row) : undefined;
+  }
+
+  /** Moves a pending draft to `status`. False when it was no longer pending, so two clicks never send twice. */
+  resolveDraft(id: string, status: Exclude<DraftStatus, 'pending'>, by: string): boolean {
+    return Number(this.db.prepare("UPDATE drafts SET status = ?, resolved_by = ? WHERE id = ? AND status = 'pending'").run(status, by, id).changes) > 0;
+  }
+
+  /** Settles every pending draft on a thread; returns their ids. */
+  settlePendingDrafts(threadId: string, status: Exclude<DraftStatus, 'pending'>, by: string): string[] {
+    const ids = (this.db.prepare("SELECT id FROM drafts WHERE thread_id = ? AND status = 'pending' ORDER BY created_at, rowid").all(threadId) as Row[]).map((r) =>
+      String(r.id),
+    );
+    for (const id of ids) this.resolveDraft(id, status, by);
+    return ids;
+  }
+
+  reopenDraft(id: string): void {
+    this.db.prepare("UPDATE drafts SET status = 'pending', resolved_by = NULL WHERE id = ?").run(id);
+  }
+
+  threadDrafts(threadId: string): Draft[] {
+    return (this.db.prepare('SELECT * FROM drafts WHERE thread_id = ? ORDER BY created_at, rowid').all(threadId) as Row[]).map(toDraft);
+  }
+
+  /** Asks received since `sinceMs` that were never answered nor handed to a session (e.g. the daemon restarted first). */
+  unansweredAsks(sinceMs: number): PeerMessage[] {
+    const rows = this.db
+      .prepare("SELECT * FROM messages WHERE direction = 'in' AND kind = 'ask' AND delivered = 0 AND received_at >= ? ORDER BY rowid")
+      .all(sinceMs) as Row[];
+    return rows.map(toMessage);
+  }
+
+  unpostedDrafts(): Draft[] {
+    return (this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NULL ORDER BY created_at, rowid').all() as Row[]).map(toDraft);
+  }
+
+  setDraftPosted(id: string, messageId: number): void {
+    this.db.prepare("UPDATE drafts SET posted_message_id = ?, shown_status = 'pending' WHERE id = ?").run(messageId, id);
+  }
+
+  /** Posted drafts whose status changed since their post was last updated. */
+  draftsToRefresh(): Draft[] {
+    return (
+      this.db.prepare('SELECT * FROM drafts WHERE posted_message_id IS NOT NULL AND status != shown_status ORDER BY created_at, rowid').all() as Row[]
+    ).map(toDraft);
+  }
+
+  setDraftShown(id: string, status: DraftStatus): void {
+    this.db.prepare('UPDATE drafts SET shown_status = ? WHERE id = ?').run(status, id);
   }
 
   markDelivered(ids: string[]): void {
@@ -374,7 +491,25 @@ function toRequest(r: Row): ConnectRequest {
 }
 
 function toLogged(r: Row): LoggedMessage {
-  return { ...toMessage(r), seq: Number(r.seq), direction: r.direction as LoggedMessage['direction'], received_at: Number(r.received_at) };
+  const m: LoggedMessage = { ...toMessage(r), seq: Number(r.seq), direction: r.direction as LoggedMessage['direction'], received_at: Number(r.received_at) };
+  if (r.via) m.via = r.via as MessageVia;
+  return m;
+}
+
+function toDraft(r: Row): Draft {
+  const d: Draft = {
+    id: String(r.id),
+    thread_id: String(r.thread_id),
+    peer: String(r.peer),
+    text: String(r.text),
+    status: r.status as DraftStatus,
+    created_at: Number(r.created_at),
+  };
+  if (r.question !== null) d.question = String(r.question);
+  if (r.resolved_by !== null) d.resolved_by = String(r.resolved_by);
+  if (r.posted_message_id !== null) d.posted_message_id = Number(r.posted_message_id);
+  if (r.shown_status !== null) d.shown_status = r.shown_status as DraftStatus;
+  return d;
 }
 
 function toMessage(r: Row): PeerMessage {

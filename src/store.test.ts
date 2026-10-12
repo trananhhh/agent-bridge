@@ -82,7 +82,7 @@ describe('BridgeStore', () => {
     expect(store.latestSeq()).toBe(store.messagesAfter(0).at(-1)?.seq);
   });
 
-  it('adds the mirror column to a database created by an older version', () => {
+  it('adds the mirror and via columns to a database created by an older version', () => {
     store.close();
     const old = join(dir, 'old.db');
     const raw = new DatabaseSync(old);
@@ -91,7 +91,47 @@ describe('BridgeStore', () => {
     raw.close();
     store = new BridgeStore(old);
     store.insertMessage(msg({ id: 'x', mirror: '-1001' }), 'in');
-    expect(store.threadMessages('t1')[0].mirror).toBe('-1001');
+    store.insertMessage(msg({ id: 'y' }), 'out', 'owner');
+    expect(store.threadMessages('t1').map((m) => [m.mirror, m.via])).toEqual([
+      ['-1001', undefined],
+      [undefined, 'owner'],
+    ]);
+  });
+
+  it('settles every pending draft on a thread at once, can reopen one, and finds unanswered asks', () => {
+    store.insertDraft({ id: 'd1', thread_id: 't1', peer: 'cu', text: 'a' });
+    store.insertDraft({ id: 'd2', thread_id: 't1', peer: 'cu', text: 'b' });
+    store.insertDraft({ id: 'd3', thread_id: 't2', peer: 'cu', text: 'c' });
+    expect(store.settlePendingDrafts('t1', 'replaced', 'Anh')).toEqual(['d1', 'd2']);
+    expect(store.getDraft('d3')?.status).toBe('pending');
+    store.reopenDraft('d2');
+    expect(store.getDraft('d2')).toMatchObject({ status: 'pending' });
+    expect(store.getDraft('d2')?.resolved_by).toBeUndefined();
+    expect(store.threadDrafts('t1').map((d) => d.id)).toEqual(['d1', 'd2']);
+
+    store.insertMessage(msg({ id: 'q1', kind: 'ask' }), 'in');
+    store.insertMessage(msg({ id: 'q2', kind: 'ask' }), 'in');
+    store.insertMessage(msg({ id: 'r1', kind: 'reply' }), 'in');
+    store.markDelivered(['q2']);
+    expect(store.unansweredAsks(Date.now() - 60_000).map((m) => m.id)).toEqual(['q1']);
+    expect(store.unansweredAsks(Date.now() + 60_000)).toEqual([]);
+  });
+
+  it('holds drafts until the owner decides, once, and tracks what their Telegram post shows', () => {
+    store.insertDraft({ id: 'd1', thread_id: 't1', peer: 'cu', question: 'ok?', text: 'answer' });
+    expect(store.pendingDraft('t1')).toMatchObject({ id: 'd1', status: 'pending', question: 'ok?' });
+    expect(store.unpostedDrafts().map((d) => d.id)).toEqual(['d1']);
+    store.setDraftPosted('d1', 77);
+    expect(store.unpostedDrafts()).toEqual([]);
+    expect(store.draftByPost(77)?.id).toBe('d1');
+    expect(store.draftsToRefresh()).toEqual([]);
+
+    expect(store.resolveDraft('d1', 'sent', 'Anh')).toBe(true);
+    expect(store.resolveDraft('d1', 'dropped', 'Anh')).toBe(false);
+    expect(store.pendingDraft('t1')).toBeUndefined();
+    expect(store.draftsToRefresh().map((d) => [d.id, d.status, d.resolved_by])).toEqual([['d1', 'sent', 'Anh']]);
+    store.setDraftShown('d1', 'sent');
+    expect(store.draftsToRefresh()).toEqual([]);
   });
 
   it('tracks outbox retries per peer', () => {

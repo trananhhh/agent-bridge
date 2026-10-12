@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createDaemon, type Daemon } from './daemon.ts';
+import { createDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
 import { BridgeStore } from './store.ts';
 import type { ClaudeRunOptions, ClaudeRunner } from './claude-runner.ts';
 import type { PeerMessage } from './protocol.ts';
@@ -22,6 +22,10 @@ interface Side {
   classifierAnswer: string;
   runnerError?: Error;
   resumeError?: Error;
+  /** What the answering agent says instead of "<side>#<n>". */
+  answerText?: string;
+  /** Answering runs wait for this before finishing. */
+  gate?: Promise<void>;
   down: boolean;
 }
 
@@ -37,11 +41,12 @@ describe('agent-bridge daemon', () => {
       if (side.runnerError) throw side.runnerError;
       if (opts.resumeSessionId && side.resumeError) throw side.resumeError;
       const sessionId = opts.resumeSessionId && !opts.fork ? opts.resumeSessionId : `${side.name}-new-${++n}`;
-      return { sessionId, result: `${side.name}#${n}`, isError: false };
+      await side.gate;
+      return { sessionId, result: side.answerText ?? `${side.name}#${n}`, isError: false };
     };
   }
 
-  function addSide(name: string, peers: { name: string; folders?: string[] }[], extra: { mirrorChat?: string } = {}): Side {
+  function addSide(name: string, peers: { name: string; folders?: string[] }[], extra: Partial<Pick<DaemonOptions, 'mirrorChat' | 'answerModel' | 'answerEffort' | 'classifierModel' | 'ownerReview' | 'coalesceMs'>> = {}): Side {
     const side = {
       name,
       store: new BridgeStore(join(dir, `${name}.db`)),
@@ -75,6 +80,7 @@ describe('agent-bridge daemon', () => {
       now: () => NOW,
       log: () => {},
       notify: (title: string) => side.notifications.push(title),
+      coalesceMs: 0,
       ...extra,
       fetchImpl: async (url, init) => {
         if (side.down) throw new Error('ECONNREFUSED');
@@ -146,6 +152,7 @@ describe('agent-bridge daemon', () => {
     expect(work(b)).toHaveLength(1);
     expect(work(b)[0]).toMatchObject({ resumeSessionId: undefined, readOnlyDirs: ['/w/shared', '/w/extra'], cwd: '/w/shared' });
     expect(work(b)[0].prompt).toContain('does orders have a provider_id column?');
+    expect(work(b)[0].appendSystemPrompt).not.toContain('[[ASK_OWNER]]');
     expect(got).toHaveLength(1);
     expect(got[0]).toMatchObject({ kind: 'reply', thread_id: sent.thread_id, from: 'cu', text: 'cu#1' });
   });
@@ -251,6 +258,196 @@ describe('agent-bridge daemon', () => {
     expect(work(b).map((c) => c.name)).toEqual([`⇄ ${a.name}: Does orders have a provider_id column? It matters for the…`, `⇄ ${a.name}: q2`, undefined]);
   });
 
+  it('answers with the configured model and effort whatever model the resumed session last used; the classifier stays on its own model', async () => {
+    const m = addSide('minh', [{ name: 'cu' }], { answerModel: 'opus', answerEffort: 'xhigh', classifierModel: 'haiku' });
+    b.store.upsertPeer({ name: 'minh', url: 'http://minh.test', token: pairToken('cu', 'minh'), folders: ['/w/shared'], remoteFolders: [] });
+    m.sessions = [{ sessionId: 'desktop-fable', cwd: '/w/shared', title: 'x', mtimeMs: NOW - 3600_000 }];
+    m.classifierAnswer = '{"session_id":"desktop-fable"}';
+    liveInbox(b, 'b-conn');
+    await b.daemon.send({ kind: 'ask', text: 'q', connId: 'b-conn', to: 'minh' });
+    await settle();
+    expect(m.calls.map((c) => [c.noTools ?? false, c.model, c.effort, c.resumeSessionId])).toEqual([
+      [true, 'haiku', undefined, undefined],
+      [false, 'opus', 'xhigh', 'desktop-fable'],
+    ]);
+  });
+
+  it('answers a burst of asks on one thread once, with every part, instead of once per part', async () => {
+    const c = addSide('chi', [{ name: 'anh' }], { coalesceMs: 30 });
+    c.sessions = [{ sessionId: 'old', cwd: '/w/shared', title: 'x', mtimeMs: NOW - 3600_000 }];
+    a.store.upsertPeer({ name: 'chi', url: 'http://chi.test', token: pairToken('anh', 'chi'), folders: ['/w/shared'], remoteFolders: [] });
+    const got = liveInbox(a, 'a-conn');
+    const first = await a.daemon.send({ kind: 'ask', text: 'part 1: fund', connId: 'a-conn', to: 'chi' });
+    await a.daemon.send({ kind: 'ask', text: 'part 2: profit', threadId: first.thread_id, connId: 'a-conn' });
+    await a.daemon.send({ kind: 'ask', text: 'part 3: 150tr', threadId: first.thread_id, connId: 'a-conn' });
+    await settle();
+    expect(work(c)).toHaveLength(1);
+    expect(work(c)[0].prompt).toMatch(/part 1: fund[^]*part 2: profit[^]*part 3: 150tr/);
+    expect(c.calls.filter((x) => x.noTools)).toHaveLength(1);
+    expect(got.map((m) => m.kind)).toEqual(['reply']);
+  });
+
+  it('a part arriving while the answer is being written gets its own answer afterwards, in the same session', async () => {
+    let release!: () => void;
+    b.gate = new Promise((r) => (release = r));
+    const got = liveInbox(a, 'a-conn');
+    const first = await a.daemon.send({ kind: 'ask', text: 'q1', connId: 'a-conn' });
+    await new Promise((r) => setTimeout(r, 5));
+    await a.daemon.send({ kind: 'ask', text: 'q2', threadId: first.thread_id, connId: 'a-conn' });
+    release();
+    await settle();
+    expect(work(b).map((c) => [c.resumeSessionId, c.prompt.includes('q2')])).toEqual([
+      [undefined, false],
+      [`${b.name}-new-1`, true],
+    ]);
+    expect(got).toHaveLength(2);
+  });
+
+  it('answers asks that arrived but were never answered before a restart', async () => {
+    const thread = 'anh-99999999-0000-0000-0000-000000000000';
+    b.store.insertMessage({ id: 'lost', thread_id: thread, from: 'anh', kind: 'ask', text: 'still there?', sent_at: 'now' }, 'in');
+    b.store.insertMessage({ id: 'done', thread_id: 'anh-answered', from: 'anh', kind: 'ask', text: 'answered', sent_at: 'now' }, 'in');
+    b.store.markDelivered(['done']);
+    b.daemon.recover();
+    await settle();
+    expect(work(b).map((c) => c.prompt.includes('still there?'))).toEqual([true]);
+    expect(a.store.threadMessages(thread).map((m) => m.kind)).toEqual(['reply']);
+  });
+
+  describe('owner review', () => {
+    let o: Side;
+    beforeEach(() => {
+      o = addSide('owner', [{ name: 'anh' }], { ownerReview: { owners: 'Cừ' } });
+      a.store.upsertPeer({ name: 'owner', url: 'http://owner.test', token: pairToken('anh', 'owner'), folders: ['/w/shared'], remoteFolders: [] });
+    });
+    const ask = async (text = 'final number?') => {
+      const got = liveInbox(a, 'a-conn');
+      const sent = await a.daemon.send({ kind: 'ask', text, connId: 'a-conn', to: 'owner' });
+      await settle();
+      return { got, thread: sent.thread_id };
+    };
+
+    it('lets the agent hand a question to the owner: nothing reaches the peer until the owner sends the draft', async () => {
+      o.answerText = '[[ASK_OWNER]] Chốt 2.400.388 chưa anh?\nSố chốt là **2.400.388**.';
+      const { got, thread } = await ask();
+      expect(work(o)[0].appendSystemPrompt).toContain('[[ASK_OWNER]]');
+      expect(work(o)[0].appendSystemPrompt).toContain('Cừ');
+      expect(got).toEqual([]);
+      const draft = o.store.pendingDraft(thread)!;
+      expect(draft).toMatchObject({ question: 'Chốt 2.400.388 chưa anh?', text: 'Số chốt là **2.400.388**.', status: 'pending', peer: 'anh' });
+
+      expect(await o.daemon.resolveDraft(draft.id, 'send', 'Cừ')).toBe('sent');
+      await settle();
+      expect(got).toHaveLength(1);
+      expect(got[0]).toMatchObject({ kind: 'reply', thread_id: thread });
+      expect(got[0].text).toContain('Số chốt là **2.400.388**.');
+      expect(got[0].text).toContain('approved by Cừ');
+      expect(o.store.threadMessages(thread).at(-1)).toMatchObject({ direction: 'out', via: 'owner' });
+      expect(await o.daemon.resolveDraft(draft.id, 'send', 'Cừ')).toBe('already handled');
+      expect(got).toHaveLength(1);
+    });
+
+    it('a newer held answer retires the older one, and an owner reply settles every pending one', async () => {
+      o.answerText = '[[ASK_OWNER]] first?\ndraft 1';
+      const { thread } = await ask();
+      const older = o.store.pendingDraft(thread)!;
+      o.answerText = '[[ASK_OWNER]] second?\ndraft 2';
+      await a.daemon.send({ kind: 'ask', text: 'and this?', threadId: thread, connId: 'a-conn' });
+      await settle();
+      const newer = o.store.pendingDraft(thread)!;
+      expect(newer.id).not.toBe(older.id);
+      expect(o.store.getDraft(older.id)?.status).toBe('superseded');
+      await o.daemon.ownerReply({ threadId: thread, text: 'mine', owner: 'Cừ', seenInChat: true });
+      expect(o.store.getDraft(newer.id)?.status).toBe('replaced');
+      expect(o.store.threadMessages(thread).at(-1)?.via).toBe('owner-in-chat');
+    });
+
+    it('holds the answer wherever the hand-off line appears and however it is formatted', async () => {
+      o.answerText = 'Đây là trả lời.\n**[[ASK_OWNER]] Chốt chưa?**\nSố chốt 2.400.388';
+      const { got, thread } = await ask();
+      expect(got).toEqual([]);
+      expect(o.store.pendingDraft(thread)).toMatchObject({ question: 'Chốt chưa?', text: 'Đây là trả lời.\nSố chốt 2.400.388' });
+    });
+
+    it('a held answer that cannot be sent stays pending', async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\ndraft';
+      const { got, thread } = await ask();
+      const draft = o.store.pendingDraft(thread)!;
+      o.store.removePeer('anh');
+      await expect(o.daemon.resolveDraft(draft.id, 'send', 'Cừ')).rejects.toThrow(/anh/);
+      expect(o.store.getDraft(draft.id)?.status).toBe('pending');
+      await expect(o.daemon.ownerReply({ threadId: thread, text: 'x', owner: 'Cừ' })).rejects.toThrow(/anh/);
+      expect(o.store.getDraft(draft.id)?.status).toBe('pending');
+      expect(got).toEqual([]);
+    });
+
+    it('tells the session answering a later ask what the owner said and decided on the thread', async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\nSố là 2.400.388';
+      const { thread } = await ask();
+      await o.daemon.resolveDraft(o.store.pendingDraft(thread)!.id, 'drop', 'Cừ');
+      await o.daemon.ownerReply({ threadId: thread, text: 'Số đúng là 2.401.000', owner: 'Cừ' });
+      await settle();
+      o.answerText = 'ok';
+      await a.daemon.send({ kind: 'ask', text: 'confirm?', threadId: thread, connId: 'a-conn' });
+      await settle();
+      const prompt = work(o).at(-1)!.prompt;
+      expect(prompt).toContain('Số đúng là 2.401.000');
+      expect(prompt).toMatch(/Số là 2\.400\.388[^\n]*not sent/);
+    });
+
+    it("a draft the owner declines is never sent", async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\ndraft';
+      const { got, thread } = await ask();
+      const draft = o.store.pendingDraft(thread)!;
+      expect(await o.daemon.resolveDraft(draft.id, 'drop', 'Cừ')).toBe('dropped');
+      await settle();
+      expect(got).toEqual([]);
+      expect(o.store.getDraft(draft.id)).toMatchObject({ status: 'dropped', resolved_by: 'Cừ' });
+    });
+
+    it("the owner's own words answer a waiting question and replace the draft; later ones are follow-up asks", async () => {
+      o.answerText = '[[ASK_OWNER]] ok?\ndraft';
+      const { got, thread } = await ask();
+      const draft = o.store.pendingDraft(thread)!;
+
+      await o.daemon.ownerReply({ threadId: thread, text: 'Đúng, 2.400.388.', owner: 'Cừ' });
+      await settle();
+      expect(o.store.getDraft(draft.id)?.status).toBe('replaced');
+      expect(got).toHaveLength(1);
+      expect(got[0]).toMatchObject({ kind: 'reply', thread_id: thread });
+      expect(got[0].text).toMatch(/Cừ[^\n]*person[^]*Đúng, 2\.400\.388\./);
+
+      await o.daemon.ownerReply({ threadId: thread, text: 'Còn khoản 150tr thì sao?', owner: 'Cừ' });
+      await settle();
+      expect(got.map((m) => m.kind)).toEqual(['reply', 'ask']);
+      expect(got[1].text).toContain('Còn khoản 150tr thì sao?');
+    });
+
+    it('an answer that finishes after the owner already replied is held for the owner, not sent too', async () => {
+      o.store.upsertPeer({ name: 'zed', url: 'http://zed.test', token: pairToken('owner', 'zed'), folders: ['/w/shared'], remoteFolders: [] });
+      let release!: () => void;
+      o.gate = new Promise((r) => (release = r));
+      const got = liveInbox(a, 'a-conn');
+      const sent = await a.daemon.send({ kind: 'ask', text: 'q', connId: 'a-conn', to: 'owner' });
+      await new Promise((r) => setTimeout(r, 5));
+      await o.daemon.ownerReply({ threadId: sent.thread_id, text: 'tôi trả lời', owner: 'Cừ' });
+      release();
+      await settle();
+      expect(got).toHaveLength(1);
+      expect(got[0].text).toContain('tôi trả lời');
+      expect(o.store.pendingDraft(sent.thread_id)).toMatchObject({ text: 'owner#1' });
+      expect(o.store.pendingDraft(sent.thread_id)?.question).toBeUndefined();
+    });
+
+    it('ignores the hand-off line when nobody reviews this machine', async () => {
+      b.answerText = '[[ASK_OWNER]] ok?\ndraft';
+      const got = liveInbox(a, 'a-conn');
+      await a.daemon.send({ kind: 'ask', text: 'q', connId: 'a-conn', to: 'cu' });
+      await settle();
+      expect(got[0].text).toBe('[[ASK_OWNER]] ok?\ndraft');
+    });
+  });
+
   it('tags outgoing messages with the Telegram chat this side mirrors to, and the receiver keeps the tag', async () => {
     const m = addSide('minh', [{ name: 'cu' }], { mirrorChat: '-1001' });
     b.store.upsertPeer({ name: 'minh', url: 'http://minh.test', token: pairToken('cu', 'minh'), folders: ['/w/shared'], remoteFolders: [] });
@@ -290,6 +487,10 @@ describe('agent-bridge daemon', () => {
     expect(cursor).toEqual({ messages: [], latest: thread.messages[1].seq });
     const { body: after } = await get(b, `/local/messages?after=${thread.messages[0].seq}`);
     expect(after.messages.map((m: any) => m.kind)).toEqual(['reply']);
+
+    b.store.insertMessage({ id: 'early', thread_id: 'anh-1234abcd-0000-0000-0000-000000000000', from: 'anh', kind: 'ask', text: 'still being answered', sent_at: 'now' }, 'in');
+    const { body: withEarly } = await get(b, '/local/threads');
+    expect(withEarly.threads[0]).toMatchObject({ thread_id: 'anh-1234abcd-0000-0000-0000-000000000000', origin: 'remote', peer: 'anh' });
   });
 
   it('headless failure still answers the peer', async () => {

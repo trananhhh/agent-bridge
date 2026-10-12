@@ -9,12 +9,16 @@ export interface ClaudeRunOptions {
   /** Display name in the /resume picker and terminal title. */
   name?: string;
   model?: string;
+  effort?: Effort;
   /** Peer-facing session: read-only tools, confined to cwd + these folders. */
   readOnlyDirs?: string[];
   noTools?: boolean;
   appendSystemPrompt?: string;
   timeoutMs?: number;
 }
+
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type Effort = (typeof EFFORTS)[number];
 
 export interface ClaudeRunResult {
   sessionId: string;
@@ -37,6 +41,7 @@ export function buildClaudeArgs(opts: Omit<ClaudeRunOptions, 'prompt' | 'cwd' | 
   if (opts.resumeSessionId && opts.fork) args.push('--fork-session');
   if (opts.name) args.push('-n', opts.name);
   if (opts.model) args.push('--model', opts.model);
+  if (opts.effort) args.push('--effort', opts.effort);
   if (opts.noTools) args.push('--tools=');
   if (opts.readOnlyDirs) {
     args.push('--tools', READ_ONLY_TOOLS, '--allowedTools', READ_ONLY_TOOLS, '--disallowedTools', WRITE_TOOLS);
