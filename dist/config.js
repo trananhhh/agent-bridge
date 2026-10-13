@@ -36,6 +36,10 @@ const ConfigSchema = z.object({
         botToken: z.string().min(1),
         chatId: z.union([z.number(), z.string().min(1)]),
         chatTitle: z.string().optional(),
+        /** Colleagues with a chat of their own (same bot): their conversation with this machine is posted there instead of in `chatId`. */
+        peerChats: z
+            .record(z.string().regex(/^[a-z0-9_-]{1,50}$/, 'peerChats: keys are connected machine names'), z.object({ chatId: z.union([z.number(), z.string().min(1)]), chatTitle: z.string().optional() }))
+            .optional(),
         /** The connected machine that reads this (shared) bot and forwards what this machine's owners do. Absent: this machine reads it. */
         hub: z.string().regex(/^[a-z0-9_-]{1,50}$/).optional(),
     })

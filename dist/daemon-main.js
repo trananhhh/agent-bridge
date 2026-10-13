@@ -10,7 +10,7 @@ import { listRecentSessions } from "./sessions.js";
 import { BridgeStore } from "./store.js";
 import { installGlobalPackage, notify, relaunchService, removePidFile, serviceInstalled, writePidFile } from "./platform.js";
 import { tailscaleWhois } from "./tailscale.js";
-import { createTelegramMirror, telegramCall } from "./telegram.js";
+import { chatForPeer, createTelegramMirror, telegramCall } from "./telegram.js";
 import { LATEST_COMMIT_URL, createUpdater, packageUrlAt, tarballAt } from "./updater.js";
 import { createTelegramInbox } from "./telegram-inbox.js";
 const OUTBOX_INTERVAL_MS = 30_000;
@@ -59,7 +59,7 @@ export async function runDaemon(opts = {}) {
         classifierModel: cfg.routing.classifierModel,
         answerModel: cfg.routing.answerModel,
         answerEffort: cfg.routing.answerEffort,
-        mirrorChat: cfg.telegram ? String(cfg.telegram.chatId) : undefined,
+        mirrorChat: cfg.telegram && ((peer) => String(chatForPeer(cfg.telegram, peer))),
         ownerReview: cfg.telegram ? { owners: ownerNames } : undefined,
         coalesceMs: COALESCE_MS,
         whois: tailscaleWhois,

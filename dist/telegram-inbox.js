@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
-import { TelegramError, telegramCall } from "./telegram.js";
+import { TelegramError, chatForPeer, configuredChats, telegramCall } from "./telegram.js";
 const SEND_BUTTON = /^c:([0-9a-f]{1,32})$/;
 const TAP_RESULT = {
     sent: 'Sent',
@@ -83,8 +83,10 @@ export function createTelegramInbox(opts) {
         const { machine, expires } = JSON.parse(raw);
         return machine && (expires ?? 0) >= now() ? machine : undefined;
     }
-    /** The shared chat, or this owner's private chat with the bot: the only places an owner acts from. */
-    const where = (chat, owner) => String(chat?.id) === String(settings().chatId) ? 'shared' : chat?.id === owner.id ? 'private' : undefined;
+    /** Any chat this machine posts to (the default or a colleague's own), or this owner's private chat with the bot: the only places an owner acts from. */
+    const where = (chat, owner) => configuredChats(settings()).includes(String(chat?.id)) ? 'shared' : chat?.id === owner.id ? 'private' : undefined;
+    /** A colleague's thread or question is acted on in that colleague's chat only, never in another colleague's. */
+    const routedTo = (chat, owner, peer) => where(chat, owner) !== 'shared' || String(chatForPeer(settings(), peer)) === String(chat?.id);
     /** A text reply to a post by the bot, where this owner acts: the only messages anyone acts on. */
     const actionable = (m, owner) => Boolean(m.text && m.reply_to_message?.from?.is_bot && where(m.chat, owner));
     function threadOf(post) {
@@ -108,6 +110,8 @@ export function createTelegramInbox(opts) {
         // In the private chat, the bot only posts questions; anything else there is not about a thread.
         if (!question && where(m.chat, owner) === 'private')
             return;
+        if (question && !routedTo(m.chat, owner, question.peer))
+            return;
         try {
             if (question) {
                 const outcome = await actions.answerOwnerQuestion(question.id, m.text, owner.name);
@@ -116,7 +120,7 @@ export function createTelegramInbox(opts) {
             }
             else {
                 const threadId = threadOf(post);
-                if (!threadId)
+                if (!threadId || !routedTo(m.chat, owner, store.getThread(threadId)?.peer))
                     return;
                 await actions.ownerReply({ threadId, text: m.text, owner: owner.name, seenInChat: true });
             }
@@ -135,7 +139,8 @@ export function createTelegramInbox(opts) {
         if (!draftId)
             return void (await call('answerCallbackQuery', { callback_query_id: q.id }).catch(() => { }));
         // The draft must be this machine's: the same bot carries other machines' drafts too.
-        if (!owner || owner.machine !== selfName || !where(q.message?.chat, owner) || !store.getDraft(draftId)) {
+        const draft = draftId ? store.getDraft(draftId) : undefined;
+        if (!owner || owner.machine !== selfName || !where(q.message?.chat, owner) || !draft || !routedTo(q.message?.chat, owner, draft.peer)) {
             await call('answerCallbackQuery', { callback_query_id: q.id, text: 'Only the owner of this answer can send it.', show_alert: true }).catch(() => { });
             return;
         }
@@ -245,7 +250,9 @@ export function createTelegramInbox(opts) {
             if (!isHub())
                 return c.json({ error: `${selfName} does not read a Telegram bot` }, 404);
             const s = settings();
-            return c.json({ botToken: s.botToken, chatId: s.chatId, chatTitle: s.chatTitle, bot: await bot(), code: claim(peer.name) });
+            // The chat routed for the joining machine, never another colleague's.
+            const own = Object.hasOwn(s.peerChats ?? {}, peer.name) ? s.peerChats[peer.name] : undefined;
+            return c.json({ botToken: s.botToken, chatId: own?.chatId ?? s.chatId, chatTitle: own ? own.chatTitle : s.chatTitle, bot: await bot(), code: claim(peer.name) });
         });
         peerApp.post('/telegram/owners', async (c) => {
             const hub = fromHub(c.req.header('authorization'));

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BridgeStore } from './store.ts';
-import { channelsFromUpdates, createTelegramMirror, nextOffset } from './telegram.ts';
+import { channelsFromUpdates, chatForPeer, createTelegramMirror, nextOffset, type TelegramTarget } from './telegram.ts';
 import type { PeerMessage } from './protocol.ts';
 import { fakeTelegram } from './test-support/fake-telegram.ts';
 
@@ -22,11 +22,11 @@ describe('telegram mirror', () => {
       { id: `m${++n}`, thread_id: THREAD, from: 'cu', kind: 'ask', text: 'q', sent_at: new Date().toISOString(), ...over },
       direction,
     );
-  const mirror = () =>
+  const mirror = (target: TelegramTarget = { botToken: '123:secret', chatId: -1001 }) =>
     createTelegramMirror({
       store,
       selfName: 'anh',
-      target: { botToken: '123:secret', chatId: -1001 },
+      target,
       owners: () => [{ id: 42, name: 'Anh' }],
       fetchImpl: tg.fetchImpl,
       log: (event) => logs.push(event),
@@ -74,6 +74,76 @@ describe('telegram mirror', () => {
     add({ from: 'anh', kind: 'reply', text: 'mine', mirror: '-1001' }, 'out');
     await m.tick();
     expect(posts().map((p) => p.split('\n\n')[1])).toEqual(['sender mirrors elsewhere', 'sender has no mirror', 'mine']);
+  });
+
+  describe('one chat per colleague', () => {
+    const SILVER = 'silver-11111111-8133-42d7-a7a9-6e7204d05aa0';
+    const routed: TelegramTarget = { botToken: '123:secret', chatId: -1001, peerChats: { silver: { chatId: -2002, chatTitle: 'Silver' } } };
+    const toChat = () => tg.sent.filter((s) => s.method === 'sendMessage').map((s) => [s.body.chat_id, String(s.body.text).split('\n\n')[1]]);
+
+    beforeEach(() => store.upsertThread({ thread_id: SILVER, origin: 'remote', peer: 'silver' }));
+
+    it('resolves a peer to its own chat, and anyone else to the default', () => {
+      expect(chatForPeer(routed, 'silver')).toBe(-2002);
+      expect(chatForPeer(routed, 'cu')).toBe(-1001);
+      expect(chatForPeer(routed, undefined)).toBe(-1001);
+      expect(chatForPeer({ botToken: 'x', chatId: 5 }, 'silver')).toBe(5);
+    });
+
+    it("posts each message to the chat routed for its thread's peer", async () => {
+      const m = mirror(routed);
+      add({ thread_id: SILVER, from: 'silver', text: 'from silver' }, 'in');
+      add({ text: 'from cu' }, 'in');
+      add({ thread_id: SILVER, from: 'anh', kind: 'reply', text: 'to silver' }, 'out');
+      await m.tick();
+      expect(toChat()).toEqual([
+        [-2002, 'from silver'],
+        [-1001, 'from cu'],
+        [-2002, 'to silver'],
+      ]);
+    });
+
+    it("leaves an incoming message to its sender only when the sender mirrors to the chat routed for that thread's peer", async () => {
+      const m = mirror(routed);
+      add({ thread_id: SILVER, from: 'silver', text: 'sender posts in silver chat', mirror: '-2002' }, 'in');
+      add({ thread_id: SILVER, from: 'silver', text: 'sender posts in the default chat', mirror: '-1001' }, 'in');
+      add({ from: 'cu', text: 'cu posts in the default chat', mirror: '-1001' }, 'in');
+      add({ from: 'cu', text: 'cu posts elsewhere', mirror: '-2002' }, 'in');
+      await m.tick();
+      expect(toChat()).toEqual([
+        [-2002, 'sender posts in the default chat'],
+        [-1001, 'cu posts elsewhere'],
+      ]);
+    });
+
+    it("sends non-private questions to the peer's chat and private ones to the owners, with the notice in the peer's chat", async () => {
+      const m = mirror(routed);
+      store.insertDraft({ id: 'dd', thread_id: SILVER, peer: 'silver', question: 'Gửi chưa?', text: 'ok' });
+      store.insertDraft({ id: 'pp', thread_id: SILVER, peer: 'silver', question: 'Riêng?', text: 'bí mật', private: true });
+      store.insertDraft({ id: 'cc', thread_id: THREAD, peer: 'cu', question: 'Cho cu?', text: 'ok' });
+      await m.tick();
+      const sent = tg.sent.map((s) => [String(s.body.chat_id), String(s.body.text).includes('waiting for') ? 'notice' : String(s.body.text).includes('bí mật') ? 'private' : 'question']);
+      expect(sent).toEqual([
+        ['-2002', 'question'],
+        ['42', 'private'],
+        ['-2002', 'notice'],
+        ['-1001', 'question'],
+      ]);
+      expect(store.draftByPost(-2002, 101)?.id).toBe('dd');
+    });
+
+    it("refreshes an answered question in the chat it was posted to", async () => {
+      const m = mirror(routed);
+      store.insertDraft({ id: 'dd', thread_id: SILVER, peer: 'silver', question: 'Gửi chưa?', text: 'ok' });
+      await m.tick();
+      store.resolveDraft('dd', 'answering', 'Anh', 'ok');
+      store.finishDraft('dd');
+      await m.tick();
+      expect(tg.sent.map((s) => [s.method, String(s.body.chat_id)])).toEqual([
+        ['sendMessage', '-2002'],
+        ['editMessageText', '-2002'],
+      ]);
+    });
   });
 
   it('splits long messages into numbered parts', async () => {

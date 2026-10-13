@@ -38,6 +38,8 @@ const HELP = `agent-bridge ${VERSION} — let Claude Code agents on different ma
   agent-bridge log [thread] [-f] what the agents said to each other (-f: keep watching)
   agent-bridge telegram [off]   post every message to a Telegram group and answer from there (--chat=, --token=;
                                 --hub=<machine> to share the bot another connected machine already reads)
+  agent-bridge telegram --peer=<machine> [off]
+                                give one colleague a group of their own (same bot; --chat= to name it)
   agent-bridge status           check daemon, Tailscale and each connection
   agent-bridge uninstall        stop the daemon, remove the MCP server (keeps ~/.agent-bridge)
 `;
@@ -410,6 +412,7 @@ async function cmdStatus(): Promise<void> {
     const owners = await api<{ owners: Owner[] }>('/local/telegram/owners').then((r) => r.owners.map((o) => o.name).join(', ')).catch(() => '');
     const reader = cfg.telegram.hub ? `bot read by ${cfg.telegram.hub}` : 'bot read here';
     console.log(`telegram: posting to ${cfg.telegram.chatTitle ?? cfg.telegram.chatId} · ${reader} · ${owners ? `${owners} answer${owners.includes(',') ? '' : 's'} from there` : 'nobody answers from there yet (run `agent-bridge telegram`)'}`);
+    for (const [peer, c] of Object.entries(cfg.telegram.peerChats ?? {})) console.log(`          ${peer} → ${c.chatTitle ?? c.chatId}`);
   }
   console.log(`answers:  ${[cfg.routing.answerModel, cfg.routing.answerEffort].filter(Boolean).join(' ')} · routing by ${cfg.routing.classifierModel}`);
   console.log(`updates:  ${cfg.autoUpdate ? 'installed automatically (checked every 6 hours)' : 'off — "autoUpdate": false in the config'}`);
@@ -523,13 +526,69 @@ async function seesWholeGroup(token: string, botId: number, chatId: number): Pro
   return member.status === 'administrator' || member.status === 'creator';
 }
 
+/** Finding the chat reads the bot's updates; this machine's daemon may be reading them too. Put it back however this ends. */
+async function detectChatPausingDaemon(raw: RawConfig, token: string, bot: string): Promise<TelegramChat | undefined> {
+  const pausedDaemon = Boolean(raw.telegram && !raw.telegram.hub && raw.telegram.botToken === token) && serviceInstalled();
+  if (pausedDaemon) {
+    uninstallService(BRIDGE_HOME);
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+      process.once(signal, () => {
+        startDaemon(raw.claudeBin ?? 'claude');
+        process.exit(130);
+      });
+    }
+  }
+  try {
+    return await detectChat(token, bot);
+  } finally {
+    if (pausedDaemon) await restartDaemon(raw);
+  }
+}
+
+/** `telegram --peer=<machine> [off]`: that colleague's conversation goes to a chat of its own, through the same bot. */
+async function cmdTelegramPeer(raw: RawConfig, peer: string, opts: { chat?: string; off: boolean }): Promise<void> {
+  if (!/^[a-z0-9_-]{1,50}$/.test(peer)) throw new Error(`"${peer}" is not a machine name (1-50 characters, lowercase a-z 0-9 _ -)`);
+  const tg = raw.telegram;
+  if (!tg) throw new Error('Telegram is not set up yet. Run: agent-bridge telegram');
+  if (tg.hub) throw new Error(`This machine posts through ${tg.hub}'s bot; run this on ${tg.hub}, which reads it.`);
+  if (opts.off) {
+    if (!tg.peerChats || !Object.hasOwn(tg.peerChats, peer)) return console.log(`${peer} has no chat of its own.`);
+    delete tg.peerChats[peer];
+    if (!Object.keys(tg.peerChats).length) delete tg.peerChats;
+    writeRawConfig(raw);
+    await restartDaemon(raw);
+    return console.log(`✓ ${peer} posts to "${tg.chatTitle ?? tg.chatId}" again`);
+  }
+  const connected = await api<{ peers: PeerView[] }>('/local/peers').then((r) => r.peers.map((p) => p.name), () => undefined);
+  if (connected && !connected.includes(peer)) throw new Error(`Not connected to "${peer}". Connected: ${connected.join(', ') || 'nobody'}`);
+
+  const bot = await telegramCall<{ id: number; username: string }>(tg.botToken, 'getMe', {}).catch((err: Error) => {
+    throw new Error(`Telegram rejected the bot token (${err.message})`);
+  });
+  const chat = opts.chat ? await resolveChannel(tg.botToken, bot.id, opts.chat) : await detectChatPausingDaemon(raw, tg.botToken, bot.username);
+  if (!chat) throw new Error(`No group found. Add @${bot.username} to ${peer}'s group as an admin (${addToGroupUrl(bot.username)}), then run this again.`);
+  if (String(chat.id) === String(tg.chatId)) throw new Error(`"${chat.title}" is already the default chat; pick ${peer}'s own group.`);
+
+  const isNew = String(tg.peerChats?.[peer]?.chatId) !== String(chat.id);
+  tg.peerChats = { ...tg.peerChats, [peer]: { chatId: chat.id, chatTitle: chat.title } };
+  writeRawConfig(raw);
+  await restartDaemon(raw);
+  console.log(`✓ the conversation with ${peer} is posted to "${chat.title}"; everyone else still goes to "${tg.chatTitle ?? tg.chatId}"`);
+  if (isNew) await telegramCall(tg.botToken, 'sendMessage', { chat_id: chat.id, text: `agent-bridge: ${raw.name}'s agent posts its conversation with ${peer} here.` });
+  if (chat.type === 'channel') return console.log('(A channel is read-only: use a group to answer from Telegram.)');
+  if (!(await seesWholeGroup(tg.botToken, bot.id, chat.id))) {
+    console.log(`! @${bot.username} only sees replies to its own posts. Make it an admin of "${chat.title}" so replies to everyone's posts reach it.`);
+  }
+}
+
 async function cmdTelegram(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
-    options: { token: { type: 'string' }, chat: { type: 'string' }, hub: { type: 'string' } },
+    options: { token: { type: 'string' }, chat: { type: 'string' }, hub: { type: 'string' }, peer: { type: 'string' } },
   });
   const raw = readRawConfig();
+  if (values.peer) return cmdTelegramPeer(raw, values.peer, { chat: values.chat, off: positionals[0] === 'off' });
   if (positionals[0] === 'off') {
     delete raw.telegram;
     writeRawConfig(raw);
@@ -568,27 +627,14 @@ async function cmdTelegram(argv: string[]): Promise<void> {
   let chat: TelegramChat | undefined;
   if (values.chat || known !== undefined) chat = await resolveChannel(token, bot.id, values.chat ?? String(known));
   else {
-    // Finding the chat reads the bot's updates; this machine's daemon may be reading them too. Put it back however this ends.
-    const pausedDaemon = Boolean(raw.telegram && !raw.telegram.hub && raw.telegram.botToken === token) && serviceInstalled();
-    if (pausedDaemon) {
-      uninstallService(BRIDGE_HOME);
-      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-        process.once(signal, () => {
-          startDaemon(raw.claudeBin ?? 'claude');
-          process.exit(130);
-        });
-      }
-    }
-    try {
-      chat = await detectChat(token, bot.username);
-    } finally {
-      if (pausedDaemon) await restartDaemon(raw);
-    }
+    chat = await detectChatPausingDaemon(raw, token, bot.username);
   }
   if (!chat) throw new Error(`No group found. Add @${bot.username} to your group as an admin (${addToGroupUrl(bot.username)}), then run this again.`);
 
   const newChat = raw.telegram?.chatId !== chat.id;
-  raw.telegram = { botToken: token, chatId: chat.id, chatTitle: chat.title };
+  // Colleagues' own chats belong to this bot: keep them when the default chat is set up again.
+  const peerChats = raw.telegram?.botToken === token ? raw.telegram.peerChats : undefined;
+  raw.telegram = { botToken: token, chatId: chat.id, chatTitle: chat.title, ...(peerChats ? { peerChats } : {}) };
   writeRawConfig(raw);
   await restartDaemon(raw);
   console.log(`✓ posting to "${chat.title}"; this machine reads @${bot.username}`);

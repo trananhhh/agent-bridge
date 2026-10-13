@@ -131,8 +131,10 @@ export function createDaemon(opts) {
             kind: input.kind,
             text: input.text,
             sent_at: new Date(now()).toISOString(),
-            ...(opts.mirrorChat ? { mirror: opts.mirrorChat } : {}),
         };
+        const mirror = opts.mirrorChat?.(peer.name);
+        if (mirror)
+            msg.mirror = mirror;
         store.insertMessage(msg, 'out', input.via);
         store.upsertThread({
             thread_id: msg.thread_id,

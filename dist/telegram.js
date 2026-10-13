@@ -1,5 +1,9 @@
 import { shortThreadId } from "./protocol.js";
 import { escapeHtml, markdownToTelegramHtml, splitMarkdown } from "./telegram-format.js";
+/** The chat a conversation with this peer is posted to. */
+export const chatForPeer = (t, peer) => (peer !== undefined && Object.hasOwn(t.peerChats ?? {}, peer) ? t.peerChats[peer].chatId : undefined) ?? t.chatId;
+/** Every chat this machine posts to: the default and each colleague's own. */
+export const configuredChats = (t) => [t.chatId, ...Object.values(t.peerChats ?? {}).map((c) => c.chatId)].map(String);
 const API = 'https://api.telegram.org';
 const CALL_TIMEOUT_MS = 15_000;
 /** Telegram caps a message at 4096 characters: Markdown source per part, and the most its HTML may grow to before re-splitting. */
@@ -126,6 +130,7 @@ export const canPost = (chatType, status, canPostMessages) => (POSTABLE_STATUS[c
  */
 export function createTelegramMirror(opts) {
     const { store, target } = opts;
+    const chatOf = (peer) => chatForPeer(target, peer);
     const now = opts.now ?? Date.now;
     if (store.getKv(CURSOR_KEY) === undefined)
         store.setKv(CURSOR_KEY, String(store.latestSeq()));
@@ -134,10 +139,10 @@ export function createTelegramMirror(opts) {
     let lastError;
     const call = (method, body) => telegramCall(target.botToken, method, { chat_id: target.chatId, ...body }, opts.fetchImpl);
     /** Returns the ids of the Telegram messages sent, in order. */
-    const sendAll = async (posts, where = {}) => {
+    const sendAll = async (posts, where) => {
         const ids = [];
         for (const [i, post] of posts.entries()) {
-            const extra = { chat_id: where.chat ?? target.chatId, link_preview_options: { is_disabled: true }, ...(i === posts.length - 1 ? where.lastExtra : {}) };
+            const extra = { chat_id: where.chat, link_preview_options: { is_disabled: true }, ...(i === posts.length - 1 ? where.lastExtra : {}) };
             try {
                 ids.push((await call('sendMessage', { text: post.html, parse_mode: 'HTML', ...extra })).message_id);
             }
@@ -178,10 +183,12 @@ export function createTelegramMirror(opts) {
                 return true;
             for (const m of batch) {
                 // Each side posts what it sends; an incoming message is posted here only if its sender doesn't mirror to this chat.
-                const theirs = m.direction === 'in' && m.mirror === String(target.chatId);
+                const peer = store.getThread(m.thread_id)?.peer;
+                const chat = chatOf(peer);
+                const theirs = m.direction === 'in' && m.mirror === String(chat);
                 if (!theirs && m.via !== 'owner-in-chat') {
-                    const to = m.direction === 'in' ? opts.selfName : (store.getThread(m.thread_id)?.peer ?? '?');
-                    if (!(await attempt(m.id, async () => void (await sendAll(formatPosts(m, to))))))
+                    const to = m.direction === 'in' ? opts.selfName : (peer ?? '?');
+                    if (!(await attempt(m.id, async () => void (await sendAll(formatPosts(m, to), { chat })))))
                         return false;
                 }
                 store.setKv(CURSOR_KEY, String(m.seq));
@@ -198,7 +205,7 @@ export function createTelegramMirror(opts) {
                 const lastExtra = d.text ? { reply_markup: { inline_keyboard: [[{ text: '✅ Send', callback_data: `c:${d.id}` }]] } } : undefined;
                 if (d.private && !owners.length)
                     opts.log('telegram_no_owner', { draft: d.id });
-                for (const chat of d.private ? owners.map((o) => o.id) : [target.chatId]) {
+                for (const chat of d.private ? owners.map((o) => o.id) : [chatOf(d.peer)]) {
                     let ids = [];
                     if (!(await attempt(d.id, async () => void (ids = await sendAll(posts, { chat, lastExtra })))))
                         return false;
@@ -208,10 +215,10 @@ export function createTelegramMirror(opts) {
             store.setDraftPosted(d.id);
             if (d.status === 'pending' && d.private) {
                 let ids = [];
-                if (!(await attempt(d.id, async () => void (ids = await sendAll([formatWaiting(d, opts.selfName, names)])))))
+                if (!(await attempt(d.id, async () => void (ids = await sendAll([formatWaiting(d, opts.selfName, names)], { chat: chatOf(d.peer) })))))
                     return false;
                 for (const id of ids)
-                    store.addDraftPost(d.id, target.chatId, id, 'notice');
+                    store.addDraftPost(d.id, chatOf(d.peer), id, 'notice');
             }
         }
         for (const p of store.draftPostsToRefresh()) {

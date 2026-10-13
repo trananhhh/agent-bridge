@@ -10,7 +10,7 @@ import { listRecentSessions } from './sessions.ts';
 import { BridgeStore } from './store.ts';
 import { installGlobalPackage, notify, relaunchService, removePidFile, serviceInstalled, writePidFile } from './platform.ts';
 import { tailscaleWhois } from './tailscale.ts';
-import { createTelegramMirror, telegramCall } from './telegram.ts';
+import { chatForPeer, createTelegramMirror, telegramCall } from './telegram.ts';
 import { LATEST_COMMIT_URL, createUpdater, packageUrlAt, tarballAt } from './updater.ts';
 import { createTelegramInbox } from './telegram-inbox.ts';
 
@@ -61,7 +61,7 @@ export async function runDaemon(opts: { logFile?: string } = {}): Promise<void> 
     classifierModel: cfg.routing.classifierModel,
     answerModel: cfg.routing.answerModel,
     answerEffort: cfg.routing.answerEffort,
-    mirrorChat: cfg.telegram ? String(cfg.telegram.chatId) : undefined,
+    mirrorChat: cfg.telegram && ((peer) => String(chatForPeer(cfg.telegram!, peer))),
     ownerReview: cfg.telegram ? { owners: ownerNames } : undefined,
     coalesceMs: COALESCE_MS,
     whois: tailscaleWhois,

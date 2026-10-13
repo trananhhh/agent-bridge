@@ -31,8 +31,8 @@ export interface DaemonOptions {
   classifierModel?: string;
   answerModel?: string;
   answerEffort?: Effort;
-  /** Telegram chat this machine mirrors its own messages to (tagged on each outgoing message). */
-  mirrorChat?: string;
+  /** Telegram chat this machine mirrors its messages with a peer to (tagged on each outgoing message to that peer). */
+  mirrorChat?: (peer: string) => string | undefined;
   /** Who follows the conversation (in Telegram) and can answer, if anyone: the agent may ask them before answering. Read on every answer. */
   ownerReview?: { owners: () => string | undefined };
   /** Asks arriving on one thread within this window are answered together. */
@@ -235,8 +235,9 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       kind: input.kind,
       text: input.text,
       sent_at: new Date(now()).toISOString(),
-      ...(opts.mirrorChat ? { mirror: opts.mirrorChat } : {}),
     };
+    const mirror = opts.mirrorChat?.(peer.name);
+    if (mirror) msg.mirror = mirror;
     store.insertMessage(msg, 'out', input.via);
     store.upsertThread({
       thread_id: msg.thread_id,

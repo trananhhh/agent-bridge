@@ -25,6 +25,15 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ name: 'anh', listenHost: '100.1.2.3', telegram: { chatId: -1001 } })).toThrow();
   });
 
+  it('accepts per-peer Telegram chats keyed by peer name', () => {
+    const base = { name: 'anh', listenHost: '100.1.2.3' };
+    const telegram = { botToken: '1:x', chatId: -1001, peerChats: { silver: { chatId: -2002, chatTitle: 'Silver' }, 'cu-2': { chatId: '@room' } } };
+    expect(parseConfig({ ...base, telegram }).telegram?.peerChats).toEqual(telegram.peerChats);
+    expect(parseConfig({ ...base, telegram: { botToken: '1:x', chatId: 1 } }).telegram?.peerChats).toBeUndefined();
+    expect(() => parseConfig({ ...base, telegram: { ...telegram, peerChats: { 'Bad Name': { chatId: 1 } } } })).toThrow();
+    expect(() => parseConfig({ ...base, telegram: { ...telegram, peerChats: { silver: {} } } })).toThrow();
+  });
+
   it('takes the answering model and effort, and the machine that reads a shared bot', () => {
     const cfg = parseConfig({
       name: 'anh',

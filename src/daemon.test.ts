@@ -525,7 +525,7 @@ describe('agent-bridge daemon', () => {
   });
 
   it('tags outgoing messages with the Telegram chat this side mirrors to, and the receiver keeps the tag', async () => {
-    const m = addSide('minh', [{ name: 'cu' }], { mirrorChat: '-1001' });
+    const m = addSide('minh', [{ name: 'cu' }], { mirrorChat: (peer) => (peer === 'cu' ? '-1001' : undefined) });
     b.store.upsertPeer({ name: 'minh', url: 'http://minh.test', token: pairToken('cu', 'minh'), folders: ['/w/shared'], remoteFolders: [] });
     liveInbox(m, 'm-conn');
     const sent = await m.daemon.send({ kind: 'ask', text: 'q', connId: 'm-conn', to: 'cu' });

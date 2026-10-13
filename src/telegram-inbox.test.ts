@@ -281,6 +281,78 @@ describe('telegram inbox', () => {
     });
   });
 
+  describe('one chat per colleague', () => {
+    const SILVER_THREAD = 'silver-11111111-8133-42d7-a7a9-6e7204d05aa0';
+    const SILVER_CHAT = -2002;
+    const silverPost = (messageId: number, chat: number) => {
+      const code = 'silver-11111111';
+      const text = `❓ silver → anh  ${code}\n\nquestion`;
+      return { message_id: messageId, from: BOT, chat: { id: chat }, text, entities: [{ type: 'code', offset: text.indexOf(code), length: code.length }] };
+    };
+    const inChat = (chat: number, over: Record<string, unknown>) => say(ANH, { chat: { id: chat, type: 'group' }, ...over });
+
+    beforeEach(() => {
+      hub.settings = { botToken: TOKEN, chatId: CHAT, chatTitle: 'TAP BOD', peerChats: { silver: { chatId: SILVER_CHAT, chatTitle: 'Silver' } } };
+      hub.store.upsertPeer({ name: 'silver', url: 'http://silver.test', token: 'tok-anh-silver', folders: ['/w'], remoteFolders: [] });
+      hub.store.upsertThread({ thread_id: THREAD, origin: 'remote', peer: 'cu' });
+      hub.store.upsertThread({ thread_id: SILVER_THREAD, origin: 'remote', peer: 'silver' });
+      hub.store.insertMessage({ id: 's', thread_id: SILVER_THREAD, from: 'silver', kind: 'ask', text: 'q', sent_at: 'now' }, 'in');
+    });
+
+    it("lets a reply in a peer's own chat act on that peer's thread only", async () => {
+      deliver(inChat(SILVER_CHAT, { reply_to_message: silverPost(90, SILVER_CHAT) }));
+      await hub.inbox.pollOnce(0);
+      expect(hub.replies.map((r) => r.threadId)).toEqual([SILVER_THREAD]);
+    });
+
+    it("does not let a reply in one peer's chat act on another peer's thread", async () => {
+      deliver(
+        inChat(SILVER_CHAT, { reply_to_message: { ...bridgePost(91), chat: { id: SILVER_CHAT } } }),
+        inChat(CHAT, { reply_to_message: silverPost(92, CHAT) }),
+        inChat(-3003, { reply_to_message: silverPost(93, -3003) }),
+      );
+      await hub.inbox.pollOnce(0);
+      expect(hub.replies).toEqual([]);
+      expect(calls('setMessageReaction')).toEqual([]);
+    });
+
+    it("ignores a reply to a question about a peer when it is made in a different configured chat", async () => {
+      hub.store.insertDraft({ id: 'dd', thread_id: SILVER_THREAD, peer: 'silver', question: 'q?', text: 'a' });
+      hub.store.addDraftPost('dd', CHAT, 70, 'full');
+      hub.store.addDraftPost('dd', SILVER_CHAT, 71, 'full');
+      deliver(
+        inChat(CHAT, { reply_to_message: { message_id: 70, from: BOT, chat: { id: CHAT }, text: 'x' } }),
+        inChat(SILVER_CHAT, { reply_to_message: { message_id: 71, from: BOT, chat: { id: SILVER_CHAT }, text: 'x' } }),
+      );
+      await hub.inbox.pollOnce(0);
+      expect(hub.answers.map((a) => a[0])).toEqual(['dd']);
+      expect(hub.answers).toHaveLength(1);
+      expect(calls('setMessageReaction')).toEqual([{ chat_id: SILVER_CHAT, message_id: messageId, reaction: [{ type: 'emoji', emoji: '👍' }] }]);
+    });
+
+    it("only honours ✅ Send tapped in the chat routed for the draft's peer", async () => {
+      hub.store.insertDraft({ id: 'dd', thread_id: SILVER_THREAD, peer: 'silver', question: 'q?', text: 'a' });
+      const tapIn = (chat: number) => ({ callback_query: { id: `cb${chat}`, from: ANH, data: 'c:dd', message: { message_id: 1, chat: { id: chat }, from: BOT } } });
+      deliver(tapIn(CHAT));
+      await hub.inbox.pollOnce(0);
+      expect(hub.confirms).toEqual([]);
+      expect(calls('answerCallbackQuery')[0]).toMatchObject({ show_alert: true });
+      deliver(tapIn(SILVER_CHAT));
+      await hub.inbox.pollOnce(0);
+      expect(hub.confirms).toEqual([['dd', 'Trần Anh']]);
+    });
+
+    it('hands a joining machine the chat routed for it, and the default chat to one without a route', async () => {
+      tg.respond({ id: 5, username: 'test_bot' });
+      const silver = await post(hub.peerApp, '/telegram/join', {}, 'tok-anh-silver');
+      expect(await silver.json()).toMatchObject({ botToken: TOKEN, chatId: SILVER_CHAT, chatTitle: 'Silver' });
+      const cu = await post(hub.peerApp, '/telegram/join', {}, 'tok-anh-cu');
+      const body = (await cu.json()) as Record<string, unknown>;
+      expect(body).toMatchObject({ chatId: CHAT, chatTitle: 'TAP BOD' });
+      expect(JSON.stringify(body)).not.toContain(String(SILVER_CHAT));
+    });
+  });
+
   describe('polling', () => {
     it('when first switched on, skips whatever was already waiting — old replies must not act now', async () => {
       const store = new BridgeStore(join(dir, 'fresh.db'));

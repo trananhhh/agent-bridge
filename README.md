@@ -78,6 +78,14 @@ What happens in the group:
 
   Nothing reaches the other side until then. The post is updated once you have decided, and the next time the agent answers on that thread, it is told what you said.
 
+#### One chat per colleague
+
+By default every conversation goes to the one group. To keep a colleague's conversation out of it, give them a group of their own on the same bot (run this on the machine that reads the bot):
+
+- `agent-bridge telegram --peer=<machine>`: add the bot to that colleague's group as an admin (or post `@<bot> hi` there, or pass `--chat=<id|@username>`). From then on the conversation with that machine, its questions to you (✅ Send, replies, waiting notices) and your replies in it live in that group only. Everyone else stays in the default group.
+- `agent-bridge telegram --peer=<machine> off` puts them back in the default group. `agent-bridge status` lists each route.
+- A reply or ✅ Send in one group can only act on that group's conversations. When a colleague joins with `agent-bridge telegram --hub=<you>`, they get their own group, never the default one. Private questions still go to your private chat with the bot.
+
 Messages leave your Tailscale network and are stored by Telegram. To stop posting, run `agent-bridge telegram off`. A channel also works, read-only.
 
 ### Updates
@@ -112,6 +120,7 @@ agent-bridge folders <name>  change which folders that person can read
 agent-bridge remove <name>   disconnect
 agent-bridge log [thread]    what the agents said to each other (-f: keep watching)
 agent-bridge telegram [off]  post every message to a Telegram group and answer from there (--hub=<machine> to share its bot)
+agent-bridge telegram --peer=<machine> [off]  give one colleague a group of their own (same bot)
 agent-bridge status          daemon, updates, Telegram, and each connection (online, version)
 agent-bridge uninstall       stop the daemon, remove the MCP server
 ```
