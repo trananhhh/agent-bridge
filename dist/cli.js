@@ -514,7 +514,7 @@ async function cmdTelegramPeer(raw, peer, opts) {
     }
     const connected = await api('/local/peers').then((r) => r.peers.map((p) => p.name), () => undefined);
     if (connected && !connected.includes(peer))
-        throw new Error(`Not connected to "${peer}". Connected: ${connected.join(', ') || 'nobody'}`);
+        console.log(`! ${peer} is not connected yet; the route applies once it is. Connected: ${connected.join(', ') || 'nobody'}`);
     const bot = await telegramCall(tg.botToken, 'getMe', {}).catch((err) => {
         throw new Error(`Telegram rejected the bot token (${err.message})`);
     });
