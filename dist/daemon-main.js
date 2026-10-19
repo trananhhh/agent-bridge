@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createClaudeRunner } from "./claude-runner.js";
 import { BRIDGE_HOME, DB_PATH, VERSION, loadConfig, readRawConfig } from "./config.js";
+import { createRemoteControl } from "./remote-control.js";
 import { createDaemon, peerForToken } from "./daemon.js";
 import { listRecentSessions } from "./sessions.js";
 import { BridgeStore } from "./store.js";
@@ -62,6 +63,7 @@ export async function runDaemon(opts = {}) {
         mirrorChat: cfg.telegram && ((peer) => String(chatForPeer(cfg.telegram, peer))),
         ownerReview: cfg.telegram ? { owners: ownerNames } : undefined,
         coalesceMs: COALESCE_MS,
+        remoteControl: cfg.remoteControl ? createRemoteControl({ claudeBin: cfg.claudeBin }) : undefined,
         whois: tailscaleWhois,
         notify,
     });

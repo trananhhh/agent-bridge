@@ -102,6 +102,10 @@ Answering sessions run **`opus`** by default, pinned explicitly. `--restricted` 
 
 `answerEffort` is one of `low`, `medium`, `high`, `xhigh` or `max`; leave it out to use the model's default. Messages a colleague's agent sends within 10 seconds of each other on one thread get **one** answer that covers them all. Questions that arrived just before the daemon restarted are still answered once it is back.
 
+### Remote Control for answering sessions
+
+Set `"remoteControl": true` in `~/.agent-bridge/config.json` (then restart the daemon) to open every session that answers a colleague as an interactive Claude Code session with Remote Control, so you can follow and steer it from claude.ai or the Claude app. Each one runs in its own window of the detached tmux session `agent-bridge-rc` (`tmux attach -t agent-bridge-rc`), named `rc-<first 8 characters of the session id>`. These sessions are yours: they have your normal tools and settings, unlike the read-only answering run. When a follow-up question resumes the same session, its window is closed for the headless run and reopened afterwards, so only one process writes the transcript at a time. Windows are never closed on idle; close them yourself. Needs `tmux` on the PATH.
+
 ## Permissions
 
 - For each connection, each side chooses which of its folders the other side may read. The other side can read **everything** in those folders, including any `.env` file.

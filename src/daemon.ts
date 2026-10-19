@@ -9,6 +9,7 @@ import { expandPath } from './config.ts';
 import { PeerMessageSchema, type MessageKind, type PeerMessage } from './protocol.ts';
 import { buildClassifierPrompt, parseClassifierOutput, resolveTarget, routeInbound, type ClassifierCandidate, type Target } from './router.ts';
 import { isWithin, type SessionCandidate } from './sessions.ts';
+import type { RemoteControl } from './remote-control.ts';
 import type { BridgeStore, ConnectRequest, Draft, MessageVia, PeerRecord } from './store.ts';
 
 /** Peer `folders`: the only directories this peer's questions may be answered from (read-only). First one hosts new sessions. */
@@ -37,6 +38,8 @@ export interface DaemonOptions {
   ownerReview?: { owners: () => string | undefined };
   /** Asks arriving on one thread within this window are answered together. */
   coalesceMs?: number;
+  /** Opens every answering session for the owner with Remote Control (config `remoteControl`). */
+  remoteControl?: RemoteControl;
   now?: () => number;
   log?: (event: string, data?: Record<string, unknown>) => void;
   fetchImpl?: (url: string, init: RequestInit) => Promise<Response>;
@@ -340,6 +343,14 @@ export function createDaemon(opts: DaemonOptions): Daemon {
     log('asked_owner', { thread: threadId, question: id, session: sessionId, private: handOff.private });
   }
 
+  function remoteControl(action: 'open' | 'close', fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      log('remote_control_failed', { action, error: (err as Error).message });
+    }
+  }
+
   /**
    * Runs one answering turn and delivers its outcome: the answer to the peer, a question to the owner,
    * or nothing when the owner already answered the peer meanwhile.
@@ -364,6 +375,7 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       let sessionId: string | undefined;
       let failed = false;
       log('headless_start', { thread: threadId, from: peer.name, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
+      if (resume && !resume.fork) remoteControl('close', () => opts.remoteControl?.close(resume.sessionId));
       const run = (target?: { sessionId: string; fork?: boolean }) =>
         opts.runner({
           prompt: task.prompt,
@@ -393,6 +405,8 @@ export function createDaemon(opts: DaemonOptions): Daemon {
       }
       task.onDone?.(sessionId);
       store.upsertThread({ thread_id: threadId, origin: 'remote', peer: peer.name, session_id: sessionId, cwd });
+      const answered = sessionId;
+      if (answered) remoteControl('open', () => opts.remoteControl?.open({ sessionId: answered, cwd, title: task.title }));
       try {
         if (owners) {
           if ((ownerReplies.get(threadId) ?? 0) > task.ownerSeen) return log('answer_discarded', { thread: threadId, reason: 'owner replied first' });

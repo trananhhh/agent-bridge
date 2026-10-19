@@ -46,7 +46,7 @@ describe('agent-bridge daemon', () => {
     };
   }
 
-  function addSide(name: string, peers: { name: string; folders?: string[] }[], extra: Partial<Pick<DaemonOptions, 'mirrorChat' | 'answerModel' | 'answerEffort' | 'classifierModel' | 'ownerReview' | 'coalesceMs'>> = {}): Side {
+  function addSide(name: string, peers: { name: string; folders?: string[] }[], extra: Partial<Pick<DaemonOptions, 'mirrorChat' | 'answerModel' | 'answerEffort' | 'classifierModel' | 'ownerReview' | 'coalesceMs' | 'remoteControl'>> = {}): Side {
     const side = {
       name,
       store: new BridgeStore(join(dir, `${name}.db`)),
@@ -170,6 +170,32 @@ describe('agent-bridge daemon', () => {
       ['proj', '/w/extra/app'],
     ]);
     expect(b.calls.filter((c) => c.noTools)).toHaveLength(1);
+  });
+
+  it('with remote control on, opens every answering session for the owner and closes it while a follow-up resumes it', async () => {
+    const rc: string[] = [];
+    b.store.close();
+    b = addSide('cu', [{ name: 'anh', folders: ['/w/shared'] }], {
+      remoteControl: { open: (s) => rc.push(`open ${s.sessionId} ${s.cwd}`), close: (id) => rc.push(`close ${id}`) },
+    });
+    const gotA = liveInbox(a, 'a-conn');
+    const first = await a.daemon.send({ kind: 'ask', text: 'q1', connId: 'a-conn' });
+    await settle();
+    await a.daemon.send({ kind: 'ask', text: 'q2', threadId: first.thread_id, connId: 'a-conn' });
+    await settle();
+    expect(rc).toEqual(['open cu-new-1 /w/shared', 'close cu-new-1', 'open cu-new-1 /w/shared']);
+    expect(gotA).toHaveLength(2);
+  });
+
+  it('a Remote Control launch that fails never blocks the answer', async () => {
+    b.store.close();
+    b = addSide('cu', [{ name: 'anh', folders: ['/w/shared'] }], {
+      remoteControl: { open: () => { throw new Error('no tmux'); }, close: () => {} },
+    });
+    const gotA = liveInbox(a, 'a-conn');
+    await a.daemon.send({ kind: 'ask', text: 'q1', connId: 'a-conn' });
+    await settle();
+    expect(gotA).toHaveLength(1);
   });
 
   it('classifier picks the peer live session → pushed there, and its reply goes back', async () => {

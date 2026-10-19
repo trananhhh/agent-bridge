@@ -21,6 +21,8 @@ const ConfigSchema = z.object({
   headlessTimeoutMs: z.number().int().positive().default(15 * 60_000),
   /** Installs new agent-bridge releases by itself (checked every few hours) and restarts. */
   autoUpdate: z.boolean().default(true),
+  /** Opens every session that answers a colleague as an interactive Remote Control session (tmux, full tools) for the owner. */
+  remoteControl: z.boolean().default(false),
   routing: z
     .object({
       recentHours: z.number().positive().default(48),

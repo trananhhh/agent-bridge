@@ -240,6 +240,14 @@ export function createDaemon(opts) {
         store.insertDraft({ id, thread_id: threadId, peer: peer.name, question: handOff.question, text: handOff.draft, session_id: sessionId, cwd, private: handOff.private });
         log('asked_owner', { thread: threadId, question: id, session: sessionId, private: handOff.private });
     }
+    function remoteControl(action, fn) {
+        try {
+            fn();
+        }
+        catch (err) {
+            log('remote_control_failed', { action, error: err.message });
+        }
+    }
     /**
      * Runs one answering turn and delivers its outcome: the answer to the peer, a question to the owner,
      * or nothing when the owner already answered the peer meanwhile.
@@ -253,6 +261,8 @@ export function createDaemon(opts) {
             let sessionId;
             let failed = false;
             log('headless_start', { thread: threadId, from: peer.name, resume: resume?.sessionId, fork: Boolean(resume?.fork), cwd });
+            if (resume && !resume.fork)
+                remoteControl('close', () => opts.remoteControl?.close(resume.sessionId));
             const run = (target) => opts.runner({
                 prompt: task.prompt,
                 cwd,
@@ -283,6 +293,9 @@ export function createDaemon(opts) {
             }
             task.onDone?.(sessionId);
             store.upsertThread({ thread_id: threadId, origin: 'remote', peer: peer.name, session_id: sessionId, cwd });
+            const answered = sessionId;
+            if (answered)
+                remoteControl('open', () => opts.remoteControl?.open({ sessionId: answered, cwd, title: task.title }));
             try {
                 if (owners) {
                     if ((ownerReplies.get(threadId) ?? 0) > task.ownerSeen)
