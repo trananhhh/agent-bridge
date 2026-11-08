@@ -5,7 +5,7 @@ import { getConnInfo } from '@hono/node-server/conninfo';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import { expandPath } from "./config.js";
-import { PeerMessageSchema } from "./protocol.js";
+import { AGENT_STYLE, PeerMessageSchema } from "./protocol.js";
 import { buildClassifierPrompt, parseClassifierOutput, resolveTarget, routeInbound } from "./router.js";
 import { isWithin } from "./sessions.js";
 const PEER_TIMEOUT_MS = 10_000;
@@ -21,7 +21,8 @@ function sessionTitle(peer, question) {
 }
 const headlessSystemPrompt = (peer) => `You are answering a message from ${peer}'s Claude Code agent via agent-bridge; nobody is at this machine. ` +
     'You can only READ the folders shared with this person. You cannot write anything; if the request needs writing, editing or running commands, ' +
-    'say exactly what is needed and that the owner of this machine must do it themselves. Your final answer is sent verbatim to the other agent.';
+    'say exactly what is needed and that the owner of this machine must do it themselves. Your final answer is sent verbatim to the other agent. ' +
+    AGENT_STYLE;
 const HAND_OFF = '[[ASK_OWNER]]';
 const HAND_OFF_PRIVATE = '[[ASK_OWNER_PRIVATE]]';
 const ownerReviewPrompt = (owners) => `\n\nThe owner of this machine (${owners}) follows this conversation in a Telegram group that the other side reads too, and can answer for themselves. ` +

@@ -6,7 +6,7 @@ import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import type { ClaudeRunner, Effort } from './claude-runner.ts';
 import { expandPath } from './config.ts';
-import { PeerMessageSchema, type MessageKind, type PeerMessage } from './protocol.ts';
+import { AGENT_STYLE, PeerMessageSchema, type MessageKind, type PeerMessage } from './protocol.ts';
 import { buildClassifierPrompt, parseClassifierOutput, resolveTarget, routeInbound, type ClassifierCandidate, type Target } from './router.ts';
 import { isWithin, type SessionCandidate } from './sessions.ts';
 import type { RemoteControl } from './remote-control.ts';
@@ -118,7 +118,8 @@ function sessionTitle(peer: string, question: string): string {
 const headlessSystemPrompt = (peer: string) =>
   `You are answering a message from ${peer}'s Claude Code agent via agent-bridge; nobody is at this machine. ` +
   'You can only READ the folders shared with this person. You cannot write anything; if the request needs writing, editing or running commands, ' +
-  'say exactly what is needed and that the owner of this machine must do it themselves. Your final answer is sent verbatim to the other agent.';
+  'say exactly what is needed and that the owner of this machine must do it themselves. Your final answer is sent verbatim to the other agent. ' +
+  AGENT_STYLE;
 
 const HAND_OFF = '[[ASK_OWNER]]';
 const HAND_OFF_PRIVATE = '[[ASK_OWNER_PRIVATE]]';

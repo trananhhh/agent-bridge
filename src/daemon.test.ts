@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createDaemon, type Daemon, type DaemonOptions } from './daemon.ts';
 import { BridgeStore } from './store.ts';
 import type { ClaudeRunOptions, ClaudeRunner } from './claude-runner.ts';
-import type { PeerMessage } from './protocol.ts';
+import { AGENT_STYLE, type PeerMessage } from './protocol.ts';
 import type { SessionCandidate } from './sessions.ts';
 
 const NOW = Date.parse('2026-10-10T12:00:00Z');
@@ -153,6 +153,7 @@ describe('agent-bridge daemon', () => {
     expect(work(b)[0]).toMatchObject({ resumeSessionId: undefined, readOnlyDirs: ['/w/shared', '/w/extra'], cwd: '/w/shared' });
     expect(work(b)[0].prompt).toContain('does orders have a provider_id column?');
     expect(work(b)[0].appendSystemPrompt).not.toContain('[[ASK_OWNER]]');
+    expect(work(b)[0].appendSystemPrompt).toContain(AGENT_STYLE);
     expect(got).toHaveLength(1);
     expect(got[0]).toMatchObject({ kind: 'reply', thread_id: sent.thread_id, from: 'cu', text: 'cu#1' });
   });

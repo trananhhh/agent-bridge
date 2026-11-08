@@ -5,7 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { readRawConfig } from './config.ts';
 import { z } from 'zod';
-import { PeerMessageSchema, type PeerMessage } from './protocol.ts';
+import { AGENT_STYLE, PeerMessageSchema, type PeerMessage } from './protocol.ts';
 import { SseParser } from './sse.ts';
 
 const MAX_WAIT_S = 300;
@@ -44,6 +44,7 @@ export async function runChannel(): Promise<void> {
   const instructions = `agent-bridge connects you to colleagues' Claude Code agents on other machines. Connected:
 ${peerLines}
 When you need information or confirmation from someone on this list (code, data, decisions in the folders they share), use ask_peer yourself instead of telling the user to go ask. Write self-contained questions (they can't see this conversation).
+${AGENT_STYLE}
 Tools: ask_peer (ask), reply (answer a thread), peer_inbox (collect waiting answers), list_peers.
 ${
   isLive
